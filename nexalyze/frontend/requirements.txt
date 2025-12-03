@@ -1,0 +1,17 @@
+# Core Frontend Framework
+streamlit==1.28.1
+
+# Data Processing
+pandas==2.1.3
+numpy==1.25.2
+requests==2.31.0
+
+# Visualization
+plotly==5.17.0
+
+# Streamlit Extensions
+streamlit-chat==0.1.1
+streamlit-agraph==0.0.45
+
+# Configuration
+python-dotenv==1.0.0
