@@ -103,11 +103,11 @@ async def lifespan(app: FastAPI):
             from services.data_service import DataService
             data_service = DataService()
             
-            # Sync initial batch in background (500 companies for fast startup)
+            # Sync all companies in background
             asyncio.create_task(
-                _safe_data_sync(data_service, limit=500)
+                _safe_data_sync(data_service, limit=None)
             )
-            logger.info("Background data sync initiated (500 companies)")
+            logger.info("Background data sync initiated (ALL companies)")
         except Exception as e:
             logger.warning(f"Could not start background data sync: {e}")
     else:
