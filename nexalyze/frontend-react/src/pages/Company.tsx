@@ -5,7 +5,7 @@ import {
     Globe, TrendingUp, Shield, AlertTriangle, Lightbulb,
     Loader2
 } from 'lucide-react';
-import { getCompanyDetails, analyzeCompany } from '../services/api';
+import { getCompanyDetails } from '../services/api';
 import type { Company, CompanyAnalysis } from '../types';
 
 export default function CompanyPage() {
@@ -35,19 +35,64 @@ export default function CompanyPage() {
         fetchCompany();
     }, [id]);
 
+    const [statusMessage, setStatusMessage] = useState('');
+
     const handleAnalyze = async () => {
         if (!company) return;
 
         setAnalyzing(true);
+        setStatusMessage('Starting analysis...');
+
         try {
-            const response = await analyzeCompany(company.name, true);
-            if (response.success && response.data) {
-                setAnalysis(response.data);
+            // Use EventSource for streaming
+            const response = await fetch(`${import.meta.env.VITE_API_URL || 'http://localhost:8000'}/api/v1/analyze/stream`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({
+                    company_name: company.name,
+                    include_competitors: true
+                })
+            });
+
+            if (!response.ok) throw new Error('Analysis failed');
+
+            const reader = response.body?.getReader();
+            const decoder = new TextDecoder();
+
+            if (!reader) throw new Error('No reader available');
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+
+                const chunk = decoder.decode(value);
+                const lines = chunk.split('\n\n');
+
+                for (const line of lines) {
+                    if (line.startsWith('data: ')) {
+                        try {
+                            const data = JSON.parse(line.slice(6));
+
+                            if (data.type === 'status') {
+                                setStatusMessage(data.message);
+                            } else if (data.type === 'result') {
+                                setAnalysis(data.data);
+                            } else if (data.type === 'error') {
+                                console.error('Stream error:', data.message);
+                            }
+                        } catch (e) {
+                            console.error('Error parsing stream data:', e);
+                        }
+                    }
+                }
             }
         } catch (error) {
             console.error('Analysis failed:', error);
         } finally {
             setAnalyzing(false);
+            setStatusMessage('');
         }
     };
 
@@ -195,7 +240,7 @@ export default function CompanyPage() {
                             {analyzing ? (
                                 <>
                                     <Loader2 className="w-5 h-5 animate-spin" />
-                                    Analyzing...
+                                    {statusMessage || 'Analyzing...'}
                                 </>
                             ) : (
                                 <>

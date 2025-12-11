@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Search as SearchIcon, Filter, Building2, MapPin, Calendar, DollarSign, Users, ExternalLink } from 'lucide-react';
 import { searchCompanies } from '../services/api';
@@ -15,11 +15,12 @@ export default function Search() {
     const [showFilters, setShowFilters] = useState(false);
 
     const handleSearch = useCallback(async () => {
-        if (!searchQuery.trim()) return;
-
         setIsSearching(true);
         try {
-            const response = await searchCompanies(searchQuery, 20);
+            // Pass empty string if query is empty to get all companies
+            const query = searchQuery.trim();
+            const response = await searchCompanies(query, 50);
+
             if (response.success && response.data) {
                 let filtered = response.data;
                 if (selectedIndustry !== 'All') {
@@ -36,6 +37,11 @@ export default function Search() {
             setIsSearching(false);
         }
     }, [searchQuery, selectedIndustry, setIsSearching, setSearchResults]);
+
+    // Initial load
+    useEffect(() => {
+        handleSearch();
+    }, []); // Run once on mount
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter') handleSearch();

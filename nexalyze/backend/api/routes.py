@@ -278,10 +278,238 @@ async def analyze_company(request: AnalysisRequest):
             request.include_competitors,
             data_service
         )
-        return {"success": True, "data": analysis}
+        
+        # Transform to match frontend expected structure
+        overview = analysis.get('overview', {})
+        market_pos = analysis.get('market_position', {})
+        comp_analysis = analysis.get('competitive_analysis', {})
+        
+        # Construct Company object (partial)
+        # Try to parse founded year safely
+        founded_str = str(overview.get('founded', '0'))
+        founded_year = 0
+        if founded_str.isdigit():
+            founded_year = int(founded_str)
+        
+        company_obj = {
+            "id": 0, # Placeholder
+            "name": overview.get('name', request.company_name),
+            "description": overview.get('description', ''),
+            "industry": overview.get('industry', ''),
+            "location": overview.get('location', ''),
+            "website": overview.get('website', ''),
+            "founded_year": founded_year,
+            "yc_batch": "",
+            "funding": overview.get('funding', ''),
+            "employees": overview.get('employees', ''),
+            "stage": overview.get('stage', ''),
+            "tags": [],
+            "long_description": overview.get('description', ''),
+            "is_active": True,
+            "source": "analysis"
+        }
+        
+        # Construct Competitors list
+        competitors_list = []
+        for comp_name in analysis.get('competitors', []):
+            competitors_list.append({
+                "id": 0,
+                "name": comp_name,
+                "description": "",
+                "industry": "",
+                "location": "",
+                "website": "",
+                "founded_year": 0,
+                "yc_batch": "",
+                "funding": "",
+                "employees": "",
+                "stage": "",
+                "tags": [],
+                "long_description": "",
+                "is_active": True,
+                "source": "competitor"
+            })
+            
+        formatted_data = {
+            "company": company_obj,
+            "competitors": competitors_list,
+            "swot": {
+                "strengths": comp_analysis.get('strengths', []),
+                "weaknesses": comp_analysis.get('weaknesses', []),
+                "opportunities": comp_analysis.get('opportunities', []),
+                "threats": comp_analysis.get('threats', [])
+            },
+            "market_size": market_pos.get('market_size', 'Unknown'),
+            "market_growth": market_pos.get('growth_rate', 'Unknown'),
+            "news": analysis.get('recent_news', [])
+        }
+        
+        return {"success": True, "data": formatted_data}
     except Exception as e:
         logger.error(f"Company analysis failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/analyze/stream")
+async def analyze_company_stream(request: AnalysisRequest):
+    """Stream company analysis using SSE with granular progress updates"""
+    async def generate_analysis_stream() -> AsyncGenerator[str, None]:
+        try:
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Initializing analysis...'})}\n\n"
+            await asyncio.sleep(0.1)
+            
+            company_name = request.company_name
+            if not company_name:
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Company name is required'})}\n\n"
+                return
+
+            # Check cache first
+            cached = research_service._get_from_cache("analysis", company_name)
+            if cached:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Found cached analysis...'})}\n\n"
+                await asyncio.sleep(0.5)
+                
+                # Transform cached data
+                formatted_data = _format_analysis_data(cached, company_name)
+                yield f"data: {json.dumps({'type': 'result', 'data': formatted_data})}\n\n"
+                yield f"data: {json.dumps({'type': 'end', 'message': 'Analysis complete'})}\n\n"
+                return
+
+            # 1. Get Company Data from DB
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Checking internal database...'})}\n\n"
+            company_data = await research_service._get_company_data(company_name, data_service)
+            
+            # 2. Parallel Data Gathering - Phase 1
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Gathering company overview and SERP data...'})}\n\n"
+            
+            # We run these sequentially to provide better progress updates, or we could use as_completed
+            # For best UX, let's do them in small groups
+            
+            overview = await research_service._get_company_overview(company_name, company_data)
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Analyzing market position...'})}\n\n"
+            
+            market_pos = await research_service._analyze_market_position(company_name, company_data)
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Fetching recent news...'})}\n\n"
+            
+            news = await research_service._get_recent_news(company_name)
+            serp_data = await research_service._get_serp_comprehensive(company_name)
+            
+            analysis_state = {
+                'company': company_name,
+                'overview': overview,
+                'market_position': market_pos,
+                'recent_news': news,
+                'serp_data': serp_data,
+                'competitors': [],
+                'competitive_analysis': {}
+            }
+            
+            # 3. Competitor Analysis
+            if request.include_competitors:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Identifying competitors...'})}\n\n"
+                competitors = await research_service._find_competitors(company_name, company_data)
+                analysis_state['competitors'] = competitors
+                
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Performing competitive analysis...'})}\n\n"
+                comp_analysis = await research_service._compare_with_competitors(company_name, competitors, company_data)
+                analysis_state['competitive_analysis'] = comp_analysis
+            
+            # 4. AI Insights
+            if research_service.gemini_service:
+                yield f"data: {json.dumps({'type': 'status', 'message': 'Generating AI strategic insights...'})}\n\n"
+                try:
+                    ai_insights = await research_service._get_ai_insights(company_name, analysis_state)
+                    analysis_state['ai_insights'] = ai_insights
+                except Exception as e:
+                    logger.warning(f"AI insights generation failed: {e}")
+            
+            # Cache the result
+            research_service._set_cache("analysis", company_name, analysis_state)
+            
+            # Format and send final result
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Finalizing report...'})}\n\n"
+            formatted_data = _format_analysis_data(analysis_state, company_name)
+            
+            yield f"data: {json.dumps({'type': 'result', 'data': formatted_data})}\n\n"
+            yield f"data: {json.dumps({'type': 'end', 'message': 'Analysis complete'})}\n\n"
+            
+        except Exception as e:
+            logger.error(f"Analysis stream failed: {e}")
+            import traceback
+            traceback.print_exc()
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+
+    return StreamingResponse(
+        generate_analysis_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
+
+def _format_analysis_data(analysis: dict, company_name: str) -> dict:
+    """Helper to format analysis data for frontend"""
+    overview = analysis.get('overview', {})
+    market_pos = analysis.get('market_position', {})
+    comp_analysis = analysis.get('competitive_analysis', {})
+    
+    founded_str = str(overview.get('founded', '0'))
+    founded_year = 0
+    if founded_str.isdigit():
+        founded_year = int(founded_str)
+    
+    company_obj = {
+        "id": 0,
+        "name": overview.get('name', company_name),
+        "description": overview.get('description', ''),
+        "industry": overview.get('industry', ''),
+        "location": overview.get('location', ''),
+        "website": overview.get('website', ''),
+        "founded_year": founded_year,
+        "yc_batch": "",
+        "funding": overview.get('funding', ''),
+        "employees": overview.get('employees', ''),
+        "stage": overview.get('stage', ''),
+        "tags": [],
+        "long_description": overview.get('description', ''),
+        "is_active": True,
+        "source": "analysis"
+    }
+    
+    competitors_list = []
+    for comp_name in analysis.get('competitors', []):
+        competitors_list.append({
+            "id": 0,
+            "name": comp_name,
+            "description": "",
+            "industry": "",
+            "location": "",
+            "website": "",
+            "founded_year": 0,
+            "yc_batch": "",
+            "funding": "",
+            "employees": "",
+            "stage": "",
+            "tags": [],
+            "long_description": "",
+            "is_active": True,
+            "source": "competitor"
+        })
+        
+    return {
+        "company": company_obj,
+        "competitors": competitors_list,
+        "swot": {
+            "strengths": comp_analysis.get('strengths', []),
+            "weaknesses": comp_analysis.get('weaknesses', []),
+            "opportunities": comp_analysis.get('opportunities', []),
+            "threats": comp_analysis.get('threats', [])
+        },
+        "market_size": market_pos.get('market_size', 'Unknown'),
+        "market_growth": market_pos.get('growth_rate', 'Unknown'),
+        "news": analysis.get('recent_news', [])
+    }
 
 @router.get("/companies/{company_id}")
 async def get_company_details(company_id: int):

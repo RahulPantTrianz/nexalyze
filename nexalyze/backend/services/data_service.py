@@ -377,12 +377,8 @@ class DataService:
         Returns:
             List of matching companies
         """
-        if not query or not isinstance(query, str):
-            return []
-        
-        query = query.strip()
-        if not query:
-            return []
+        # Allow empty query to return all companies
+        query = query.strip() if query and isinstance(query, str) else ""
         
         logger.info(f"Searching companies: '{query}' (limit: {limit})")
         
@@ -405,8 +401,9 @@ class DataService:
             except Exception as e:
                 logger.warning(f"PostgreSQL search failed: {e}")
         
-        # Fallback to curated sample data if no results
-        if not results:
+        # Fallback to curated sample data if no results AND query is not empty
+        # If query is empty, we only want DB results
+        if not results and query:
             logger.info("No results, using sample data")
             results = self._get_sample_companies(query, limit)
         
@@ -427,46 +424,51 @@ class DataService:
         
         # Build filter conditions
         filter_conditions = []
-        params = [f"%{query.lower()}%", f"%{query.lower()}%", f"%{query.lower()}%"]
+        params = []
+        
+        # Add query condition if present
+        if query:
+            filter_conditions.append("(LOWER(name) LIKE %s OR LOWER(description) LIKE %s OR LOWER(industry) LIKE %s)")
+            params.extend([f"%{query.lower()}%", f"%{query.lower()}%", f"%{query.lower()}%"])
         
         if filters:
             if filters.get("industry"):
-                filter_conditions.append("AND LOWER(industry) LIKE %s")
+                filter_conditions.append("LOWER(industry) LIKE %s")
                 params.append(f"%{filters['industry'].lower()}%")
             
             if filters.get("location"):
-                filter_conditions.append("AND LOWER(location) LIKE %s")
+                filter_conditions.append("LOWER(location) LIKE %s")
                 params.append(f"%{filters['location'].lower()}%")
             
             if filters.get("stage"):
-                filter_conditions.append("AND stage = %s")
+                filter_conditions.append("stage = %s")
                 params.append(filters["stage"])
             
             if filters.get("min_year"):
-                filter_conditions.append("AND founded_year >= %s")
+                filter_conditions.append("founded_year >= %s")
                 params.append(filters["min_year"])
         
-        filter_str = " ".join(filter_conditions)
+        where_clause = "WHERE " + " AND ".join(filter_conditions) if filter_conditions else ""
         
+        # Order by relevance if query exists, otherwise by recently updated
+        order_clause = ""
+        if query:
+            order_clause = "ORDER BY CASE WHEN LOWER(name) LIKE %s THEN 0 ELSE 1 END, founded_year DESC"
+            params.append(f"%{query.lower()}%")
+        else:
+            order_clause = "ORDER BY created_at DESC, founded_year DESC"
+            
         sql = f"""
             SELECT 
                 id, name, description, industry, founded_year, location,
                 website, yc_batch, funding, employees, stage, tags
             FROM companies
-            WHERE (
-                LOWER(name) LIKE %s
-                OR LOWER(description) LIKE %s
-                OR LOWER(industry) LIKE %s
-            )
-            {filter_str}
-            ORDER BY 
-                CASE WHEN LOWER(name) LIKE %s THEN 0 ELSE 1 END,
-                founded_year DESC
+            {where_clause}
+            {order_clause}
             LIMIT %s
         """
         
-        # Add sort param and limit
-        params.append(f"%{query.lower()}%")
+        # Add limit
         params.append(limit)
         
         results = postgres_conn.query(sql, tuple(params))
