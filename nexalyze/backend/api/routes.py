@@ -5,15 +5,19 @@ from typing import List, Optional, Dict, Any, AsyncGenerator
 from agents.crew_manager import CrewManager
 from services.data_service import DataService
 from services.research_service import ResearchService
-from services.report_service import EnhancedReportService
+from services.report_service import ReportService
 from services.hacker_news_service import HackerNewsService
-from services.enhanced_scraper_service import EnhancedScraperService
+from services.web_scraper_service import ScraperService
 from services.competitive_intelligence_service import competitive_intel_service
+from services.gemini_service import get_gemini_service
+from services.data_sources_external import DataSources
+from config.settings import settings
 import logging
 import os
 import time
 import json
 import asyncio
+from datetime import datetime
 
 # Initialize router
 router = APIRouter()
@@ -22,20 +26,97 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 # Initialize services
-enhanced_report_service = EnhancedReportService()
+report_service = ReportService()
 
 @router.post("/generate-comprehensive-report")
 async def generate_comprehensive_report(request: dict):
-    """Generate comprehensive report for any topic"""
+    """
+    Generate comprehensive report for any topic using LangGraph report agent.
+    Supports multi-stage workflow: content table creation -> section generation -> report compilation.
+    """
     try:
         topic = request.get("topic", "")
         report_type = request.get("report_type", "comprehensive")
         format = request.get("format", "pdf")
+        use_langgraph = request.get("use_langgraph", True)  # Use new LangGraph agent by default
         
         if not topic:
             raise HTTPException(status_code=400, detail="Topic is required")
         
-        result = await enhanced_report_service.generate_comprehensive_report(
+        # Use LangGraph report agent if enabled
+        if use_langgraph:
+            try:
+                from agents.report_agent import get_report_agent_graph
+                from langchain_core.messages import HumanMessage
+                
+                graph = get_report_agent_graph()
+                session_id = f"report_{datetime.now().timestamp()}"
+                
+                initial_state = {
+                    "messages": [HumanMessage(content=f"Generate a {report_type} report on {topic}")],
+                    "session_id": session_id,
+                    "topic": topic,
+                    "report_type": report_type,
+                    "content_table": None,
+                    "current_section": None,
+                    "report_sections": [],
+                    "status": "drafting"
+                }
+                
+                config = {
+                    "configurable": {
+                        "thread_id": session_id
+                    }
+                }
+                
+                logger.info(f"Using LangGraph report agent for topic: {topic}")
+                result = await graph.ainvoke(initial_state, config=config)
+                
+                # Extract generated sections and content table
+                report_sections = result.get("report_sections", [])
+                content_table = result.get("content_table")
+                
+                if report_sections:
+                    # Get analysis data and charts for compilation
+                    analysis_data = await report_service._analyze_topic_comprehensively(topic, report_type)
+                    chart_paths = await report_service._generate_charts_for_topic(topic, analysis_data)
+                    
+                    # Compile report from LangGraph sections
+                    if format.lower() == "pdf":
+                        report_path = await report_service._compile_langgraph_report_to_pdf(
+                            topic, report_sections, content_table, analysis_data, chart_paths, report_type
+                        )
+                    elif format.lower() == "docx":
+                        report_path = await report_service._compile_langgraph_report_to_docx(
+                            topic, report_sections, content_table, analysis_data, chart_paths, report_type
+                        )
+                    else:
+                        raise ValueError(f"Unsupported format: {format}")
+                    
+                    return {
+                        "success": True,
+                        "report_path": report_path,
+                        "report_filename": os.path.basename(report_path),
+                        "topic": topic,
+                        "report_type": report_type,
+                        "format": format,
+                        "charts_generated": len(chart_paths),
+                        "sections_generated": len(report_sections),
+                        "generated_at": datetime.now().isoformat(),
+                        "method": "langgraph"
+                    }
+                else:
+                    # Fallback to direct generation if no sections generated
+                    logger.warning("No sections generated by LangGraph, falling back to traditional method")
+                    pass
+                    
+            except Exception as langgraph_error:
+                logger.warning(f"LangGraph report agent failed, falling back to direct generation: {langgraph_error}")
+                # Fall through to direct generation
+                pass
+        
+        # Direct generation (fallback or if use_langgraph=False)
+        result = await report_service.generate_comprehensive_report(
             topic=topic,
             report_type=report_type,
             format=format
@@ -45,6 +126,8 @@ async def generate_comprehensive_report(request: dict):
         
     except Exception as e:
         logger.error(f"Report generation failed: {e}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/download-report/{report_filename}")
@@ -55,7 +138,7 @@ async def download_report(report_filename: str):
         if ".." in report_filename or "/" in report_filename or "\\" in report_filename:
             raise HTTPException(status_code=400, detail="Invalid filename")
         
-        report_path = os.path.join(enhanced_report_service.reports_dir, report_filename)
+        report_path = os.path.join(report_service.reports_dir, report_filename)
         
         if not os.path.exists(report_path):
             raise HTTPException(status_code=404, detail="Report not found")
@@ -85,7 +168,7 @@ async def download_report(report_filename: str):
 async def cleanup_old_reports(days_old: int = 7):
     """Clean up old report files"""
     try:
-        cleaned_count = enhanced_report_service.cleanup_old_reports(days_old)
+        cleaned_count = report_service.cleanup_old_reports(days_old)
         return {
             "success": True,
             "message": f"Cleaned up {cleaned_count} old files",
@@ -368,7 +451,6 @@ class ReportRequest(BaseModel):
 # Initialize services
 data_service = DataService()
 research_service = ResearchService()
-report_service = enhanced_report_service
 hacker_news_service = HackerNewsService()
 
 @router.post("/research")
@@ -441,56 +523,140 @@ async def get_knowledge_graph_by_name(company_name: str):
 
 @router.post("/chat")
 async def chat_interface(request: ResearchRequest):
-    """Conversational interface for natural language queries"""
+    """
+    Conversational interface for natural language queries using LangGraph agent.
+    Supports tool-based interactions for company search, analysis, and report generation.
+    """
     try:
-        crew_manager = CrewManager()
-        response = await crew_manager.handle_conversation(request.query, request.user_session)
-        return {"success": True, "data": response}
+        from agents.langgraph_agent import get_conversational_agent_graph
+        from langchain_core.messages import HumanMessage
+        from datetime import datetime
+        
+        # Get the graph
+        graph = get_conversational_agent_graph()
+        
+        # Create initial state
+        session_id = request.user_session or f"session_{datetime.now().timestamp()}"
+        initial_state = {
+            "messages": [HumanMessage(content=request.query)],
+            "session_id": session_id,
+            "user_query": request.query,
+            "context": {},
+            "tools_used": [],
+            "iteration_count": 0
+        }
+        
+        # Create config with thread_id for state persistence
+        config = {
+            "configurable": {
+                "thread_id": session_id
+            }
+        }
+        
+        # Invoke the graph
+        logger.info(f"Invoking conversational agent for session: {session_id}")
+        result = await graph.ainvoke(initial_state, config=config)
+        
+        # Extract the final response
+        messages = result.get("messages", [])
+        if messages:
+            last_message = messages[-1]
+            if hasattr(last_message, 'content'):
+                response_text = last_message.content
+            else:
+                response_text = str(last_message)
+        else:
+            response_text = "I apologize, but I couldn't generate a response. Please try again."
+        
+        return {
+            "success": True,
+            "data": {
+                "response": response_text,
+                "session_id": session_id,
+                "tools_used": result.get("tools_used", []),
+                "iterations": result.get("iteration_count", 0)
+            }
+        }
     except Exception as e:
         logger.error(f"Chat interface failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        import traceback
+        traceback.print_exc()
+        # Fallback to CrewManager if LangGraph fails
+        try:
+            crew_manager = CrewManager()
+            response = await crew_manager.handle_conversation(request.query, request.user_session)
+            return {"success": True, "data": response}
+        except Exception as fallback_error:
+            logger.error(f"Fallback chat also failed: {fallback_error}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/chat/stream")
 async def chat_stream(request: ResearchRequest):
     """
-    Streaming conversational interface for natural language queries
-    Returns Server-Sent Events (SSE) for real-time streaming
+    Streaming conversational interface for natural language queries using LangGraph agent.
+    Returns Server-Sent Events (SSE) for real-time streaming.
     """
     async def generate_stream() -> AsyncGenerator[str, None]:
         try:
-            crew_manager = CrewManager()
+            from agents.langgraph_agent import get_conversational_agent_graph
+            from langchain_core.messages import HumanMessage
+            from datetime import datetime
             
             # Send initial message
             yield f"data: {json.dumps({'type': 'start', 'message': 'Processing your query...'})}\n\n"
             await asyncio.sleep(0.1)
             
-            # Get the full response (CrewAI doesn't support native streaming yet)
-            # But we can simulate it by chunking the response
-            response = await crew_manager.handle_conversation(request.query, request.user_session)
+            # Get the graph
+            graph = get_conversational_agent_graph()
+            session_id = request.user_session or f"session_{datetime.now().timestamp()}"
             
-            # Send response in chunks for better UX
-            if isinstance(response, str):
-                text = response
-            else:
-                text = str(response)
+            # Create initial state
+            initial_state = {
+                "messages": [HumanMessage(content=request.query)],
+                "session_id": session_id,
+                "user_query": request.query,
+                "context": {},
+                "tools_used": [],
+                "iteration_count": 0
+            }
             
-            # Split into sentences for streaming effect
-            import re
-            sentences = re.split(r'([.!?]\s+)', text)
+            config = {
+                "configurable": {
+                    "thread_id": session_id
+                }
+            }
             
-            for i in range(0, len(sentences), 2):
-                chunk = sentences[i]
-                if i + 1 < len(sentences):
-                    chunk += sentences[i + 1]
+            # Stream the graph execution
+            async for event in graph.astream(initial_state, config=config):
+                # Check for tool execution
+                if "tools" in event:
+                    yield f"data: {json.dumps({'type': 'tool', 'message': 'Executing tools...'})}\n\n"
                 
-                yield f"data: {json.dumps({'type': 'content', 'message': chunk})}\n\n"
-                await asyncio.sleep(0.05)  # Small delay for streaming effect
+                # Check for agent response
+                if "agent" in event:
+                    agent_messages = event["agent"].get("messages", [])
+                    if agent_messages:
+                        last_msg = agent_messages[-1]
+                        if hasattr(last_msg, 'content') and last_msg.content:
+                            # Stream the content
+                            text = last_msg.content
+                            sentences = re.split(r'([.!?]\s+)', text)
+                            
+                            for i in range(0, len(sentences), 2):
+                                chunk = sentences[i]
+                                if i + 1 < len(sentences):
+                                    chunk += sentences[i + 1]
+                                
+                                yield f"data: {json.dumps({'type': 'content', 'message': chunk})}\n\n"
+                                await asyncio.sleep(0.05)
             
             # Send completion message
             yield f"data: {json.dumps({'type': 'end', 'message': 'Complete'})}\n\n"
             
         except Exception as e:
             logger.error(f"Chat stream failed: {e}")
+            import traceback
+            traceback.print_exc()
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     
     return StreamingResponse(
@@ -505,25 +671,101 @@ async def chat_stream(request: ResearchRequest):
 
 @router.post("/sync-data")
 async def sync_yc_data(request: dict):
-    """Sync Y Combinator data on demand"""
+    """Sync Y Combinator data on demand
+    
+    Request body:
+    {
+        "source": "yc",  # Optional, defaults to "yc"
+        "limit": 500,    # Optional, if None or 0, syncs all companies
+        "sync_all": false  # Optional, if true, ignores limit and syncs all
+    }
+    """
     try:
         source = request.get("source", "yc")
         limit = request.get("limit", 500)
+        sync_all = request.get("sync_all", False)
+        
+        # If sync_all is True, set limit to None
+        if sync_all:
+            limit = None
+            logger.info("Full sync requested - syncing all companies")
+        elif limit == 0:
+            limit = None
+            logger.info("Limit is 0 - syncing all companies")
         
         if source == "yc":
             result = await data_service.sync_yc_data(limit=limit)
-            return {
-                "success": True, 
-                "data": {
-                    "synced_count": result,
-                    "source": "Y Combinator API"
+            
+            # Handle both old format (int) and new format (dict)
+            if isinstance(result, dict):
+                return {
+                    "success": True, 
+                    "data": {
+                        "synced_count": result.get("synced", 0),
+                        "skipped_count": result.get("skipped", 0),
+                        "failed_count": result.get("failed", 0),
+                        "total_available": result.get("total_available", 0),
+                        "source": "Y Combinator API",
+                        "sync_all": sync_all or limit is None
+                    }
                 }
-            }
+            else:
+                # Legacy format
+                return {
+                    "success": True, 
+                    "data": {
+                        "synced_count": result,
+                        "source": "Y Combinator API"
+                    }
+                }
         else:
             raise HTTPException(status_code=400, detail=f"Unknown source: {source}")
             
     except Exception as e:
         logger.error(f"Data sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/sync-data/all")
+async def sync_all_yc_data():
+    """Sync ALL Y Combinator companies (no limit)"""
+    try:
+        logger.info("Full sync endpoint called - syncing all companies")
+        result = await data_service.sync_yc_data(limit=None)
+        
+        return {
+            "success": True,
+            "data": result
+        }
+    except Exception as e:
+        logger.error(f"Full data sync failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/sync-data/status")
+async def get_sync_status():
+    """Get current sync status and statistics"""
+    try:
+        from database.connections import neo4j_conn
+        
+        # Get company count from Neo4j
+        company_count = 0
+        if neo4j_conn.is_connected():
+            try:
+                with neo4j_conn.driver.session() as session:
+                    result = session.run("MATCH (c:Company) RETURN count(c) as total")
+                    record = result.single()
+                    company_count = record["total"] if record else 0
+            except Exception as e:
+                logger.warning(f"Could not get company count: {e}")
+        
+        return {
+            "success": True,
+            "data": {
+                "total_companies_in_db": company_count,
+                "neo4j_connected": neo4j_conn.is_connected()
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to get sync status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/reports/generate")
@@ -786,7 +1028,7 @@ async def comprehensive_scrape(request: ComprehensiveScrapeRequest):
     try:
         logger.info(f"Starting comprehensive scrape with sources: {request.sources}")
         
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         result = await scraper.comprehensive_scrape(
             sources=request.sources,
             limit_per_source=request.limit_per_source,
@@ -810,7 +1052,7 @@ async def scrape_yc_companies(limit: int = 100, store: bool = True):
     try:
         logger.info(f"Scraping YC directory (limit: {limit})")
         
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         companies = await scraper.scrape_yc_directory(limit=limit)
         
         if store and companies:
@@ -834,7 +1076,7 @@ async def scrape_product_hunt(limit: int = 50, store: bool = True):
     try:
         logger.info(f"Scraping Product Hunt (limit: {limit})")
         
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         companies = await scraper.scrape_product_hunt(limit=limit)
         
         if store and companies:
@@ -858,7 +1100,7 @@ async def scrape_betalist(limit: int = 50, store: bool = True):
     try:
         logger.info(f"Scraping BetaList (limit: {limit})")
         
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         companies = await scraper.scrape_betalist(limit=limit)
         
         if store and companies:
@@ -882,7 +1124,7 @@ async def scrape_with_serp(query: str, store: bool = True):
     try:
         logger.info(f"SERP API search for: {query}")
         
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         companies = await scraper.scrape_with_serp_api(query)
         
         if store and companies:
@@ -904,7 +1146,7 @@ async def scrape_with_serp(query: str, store: bool = True):
 async def test_serp_api():
     """Test SERP API configuration"""
     try:
-        scraper = EnhancedScraperService()
+        scraper = ScraperService()
         
         if not scraper.serp_api_key:
             return {
@@ -1382,4 +1624,451 @@ async def get_chat_history(session_id: str, limit: int = 50):
         
     except Exception as e:
         logger.error(f"Get chat history failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== ENHANCED DATA SOURCES API ====================
+
+class ComprehensiveCompanyRequest(BaseModel):
+    company_name: str
+    include_all_sources: Optional[bool] = True
+
+class StartupSearchRequest(BaseModel):
+    query: str
+    industry: Optional[str] = None
+    limit: Optional[int] = 50
+
+@router.post("/data-sources/company")
+async def get_comprehensive_company_data(request: ComprehensiveCompanyRequest):
+    """
+    Get comprehensive company data from 25+ sources
+    
+    Sources include:
+    - Hacker News (Algolia API)
+    - News aggregators (Google News RSS, NewsAPI if configured)
+    - SERP API (Knowledge Graph, Related Searches, News)
+    - Reddit discussions
+    - GitHub organization info
+    - OpenCorporates global registry
+    - UK Companies House
+    """
+    try:
+        logger.info(f"Fetching comprehensive data for: {request.company_name}")
+        
+        async with DataSources() as data_sources:
+            result = await data_sources.get_comprehensive_company_data(
+                request.company_name,
+                include_all=request.include_all_sources
+            )
+        
+        return {"success": True, "data": result}
+        
+    except Exception as e:
+        logger.error(f"Comprehensive company data failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/data-sources/search-startups")
+async def search_startups_comprehensive(request: StartupSearchRequest):
+    """
+    Search startups across all available data sources
+    
+    Sources:
+    - Y Combinator directory
+    - Product Hunt
+    - BetaList
+    - Hacker News mentions
+    - SERP API discovery
+    """
+    try:
+        logger.info(f"Searching startups: {request.query}")
+        
+        async with DataSources() as data_sources:
+            result = await data_sources.search_startups_comprehensive(
+                query=request.query,
+                industry=request.industry,
+                limit=request.limit
+            )
+        
+        return {"success": True, "data": result}
+        
+    except Exception as e:
+        logger.error(f"Startup search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/yc-companies")
+async def get_yc_companies(limit: int = 100, industry: str = None):
+    """Get Y Combinator companies from API"""
+    try:
+        async with DataSources() as data_sources:
+            companies = await data_sources.get_yc_companies(limit=limit, industry=industry)
+        
+        return {
+            "success": True,
+            "count": len(companies),
+            "data": companies
+        }
+        
+    except Exception as e:
+        logger.error(f"YC companies fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/github-trending")
+async def get_github_trending(language: str = None, since: str = "weekly"):
+    """Get GitHub trending repositories"""
+    try:
+        async with DataSources() as data_sources:
+            repos = await data_sources.get_github_trending(language=language, since=since)
+        
+        return {
+            "success": True,
+            "count": len(repos),
+            "data": repos
+        }
+        
+    except Exception as e:
+        logger.error(f"GitHub trending fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/github-org/{org_name}")
+async def get_github_org_info(org_name: str):
+    """Get GitHub organization information"""
+    try:
+        async with DataSources() as data_sources:
+            org_info = await data_sources.get_github_org_info(org_name)
+        
+        if org_info:
+            return {"success": True, "data": org_info}
+        else:
+            raise HTTPException(status_code=404, detail="Organization not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"GitHub org info failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/hacker-news-search")
+async def search_hacker_news(query: str, limit: int = 20):
+    """Search Hacker News via Algolia API"""
+    try:
+        async with DataSources() as data_sources:
+            mentions = await data_sources.get_hacker_news_mentions(query, limit=limit)
+        
+        return {
+            "success": True,
+            "count": len(mentions),
+            "data": mentions
+        }
+        
+    except Exception as e:
+        logger.error(f"HN search failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/news/{company_name}")
+async def get_company_news(company_name: str, days: int = 7):
+    """Get recent news for a company"""
+    try:
+        async with DataSources() as data_sources:
+            news = await data_sources.get_news(company_name, days=days)
+        
+        return {
+            "success": True,
+            "count": len(news),
+            "data": news
+        }
+        
+    except Exception as e:
+        logger.error(f"News fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/reddit/{query}")
+async def get_reddit_discussions(query: str, subreddits: str = None):
+    """Get Reddit discussions about a topic"""
+    try:
+        subreddit_list = subreddits.split(',') if subreddits else None
+        
+        async with DataSources() as data_sources:
+            discussions = await data_sources.get_reddit_discussions(query, subreddits=subreddit_list)
+        
+        return {
+            "success": True,
+            "count": len(discussions),
+            "data": discussions
+        }
+        
+    except Exception as e:
+        logger.error(f"Reddit fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/world-bank/{country_code}")
+async def get_world_bank_data(country_code: str = "USA"):
+    """Get World Bank economic indicators"""
+    try:
+        async with DataSources() as data_sources:
+            data = await data_sources.get_world_bank_indicators(country_code)
+        
+        return {"success": True, "data": data}
+        
+    except Exception as e:
+        logger.error(f"World Bank fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/data-sources/stock/{symbol}")
+async def get_stock_data(symbol: str):
+    """Get stock data from Yahoo Finance"""
+    try:
+        async with DataSources() as data_sources:
+            stock = await data_sources.get_stock_data(symbol)
+        
+        if stock:
+            return {"success": True, "data": stock}
+        else:
+            raise HTTPException(status_code=404, detail="Stock not found")
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Stock fetch failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== GEMINI AI DIRECT ENDPOINTS ====================
+
+class AIQueryRequest(BaseModel):
+    prompt: str
+    temperature: Optional[float] = 0.3
+    session_id: Optional[str] = None
+
+class AICompanyRequest(BaseModel):
+    company_name: str
+    company_data: Optional[Dict[str, Any]] = None
+
+@router.post("/ai/generate")
+async def generate_ai_response(request: AIQueryRequest):
+    """Direct Gemini AI content generation"""
+    try:
+        gemini_service = get_gemini_service()
+        response = await gemini_service.generate_content(
+            request.prompt,
+            temperature=request.temperature,
+            session_id=request.session_id
+        )
+        
+        return {
+            "success": True,
+            "response": response
+        }
+        
+    except Exception as e:
+        logger.error(f"AI generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/ai/analyze-company")
+async def ai_analyze_company(request: AICompanyRequest):
+    """AI-powered company analysis"""
+    try:
+        gemini_service = get_gemini_service()
+        analysis = await gemini_service.analyze_company(
+            request.company_name,
+            request.company_data
+        )
+        
+        return {
+            "success": True,
+            "company": request.company_name,
+            "analysis": analysis
+        }
+        
+    except Exception as e:
+        logger.error(f"AI company analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/ai/discover-competitors")
+async def ai_discover_competitors(request: AICompanyRequest):
+    """AI-powered competitor discovery"""
+    try:
+        gemini_service = get_gemini_service()
+        industry = request.company_data.get('industry') if request.company_data else None
+        
+        competitors = await gemini_service.discover_competitors(
+            request.company_name,
+            industry
+        )
+        
+        return {
+            "success": True,
+            "company": request.company_name,
+            "competitors": competitors,
+            "count": len(competitors)
+        }
+        
+    except Exception as e:
+        logger.error(f"AI competitor discovery failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/ai/knowledge-graph")
+async def ai_knowledge_graph(request: AICompanyRequest):
+    """AI-generated knowledge graph data"""
+    try:
+        gemini_service = get_gemini_service()
+        graph_data = await gemini_service.generate_knowledge_graph_data(
+            request.company_name,
+            request.company_data
+        )
+        
+        return {
+            "success": True,
+            "company": request.company_name,
+            "graph_data": graph_data
+        }
+        
+    except Exception as e:
+        logger.error(f"AI knowledge graph failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/ai/swot")
+async def ai_swot_analysis(request: AICompanyRequest):
+    """AI-generated SWOT analysis"""
+    try:
+        gemini_service = get_gemini_service()
+        swot = await gemini_service.generate_swot_analysis(
+            request.company_name,
+            request.company_data
+        )
+        
+        return {
+            "success": True,
+            "company": request.company_name,
+            "swot": swot
+        }
+        
+    except Exception as e:
+        logger.error(f"AI SWOT analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.post("/ai/chat")
+async def ai_chat(request: AIQueryRequest):
+    """AI chat with conversation memory"""
+    try:
+        gemini_service = get_gemini_service()
+        response = await gemini_service.chat(
+            request.prompt,
+            session_id=request.session_id or "default"
+        )
+        
+        return {
+            "success": True,
+            "response": response,
+            "session_id": request.session_id
+        }
+        
+    except Exception as e:
+        logger.error(f"AI chat failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.delete("/ai/chat/{session_id}")
+async def clear_ai_chat_session(session_id: str):
+    """Clear AI chat session"""
+    try:
+        gemini_service = get_gemini_service()
+        gemini_service.clear_chat_session(session_id)
+        
+        return {
+            "success": True,
+            "message": f"Session {session_id} cleared"
+        }
+        
+    except Exception as e:
+        logger.error(f"Clear session failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== HEALTH & STATUS ====================
+
+@router.get("/health/ai")
+async def check_ai_health():
+    """Check AI service health"""
+    try:
+        gemini_service = get_gemini_service()
+        
+        # Quick test
+        response = await gemini_service.generate_content(
+            "Say 'OK' to confirm you are working.",
+            temperature=0.1
+        )
+        
+        return {
+            "success": True,
+            "ai_provider": "Google Gemini",
+            "model": "gemini-1.5-flash",
+            "status": "healthy" if response else "degraded",
+            "test_response": response[:100] if response else None
+        }
+        
+    except Exception as e:
+        logger.error(f"AI health check failed: {e}")
+        return {
+            "success": False,
+            "ai_provider": "Google Gemini",
+            "status": "unhealthy",
+            "error": str(e)
+        }
+
+@router.get("/health/data-sources")
+async def check_data_sources_health():
+    """Check data sources connectivity"""
+    try:
+        status = {
+            "yc_api": False,
+            "hacker_news": False,
+            "serp_api": bool(settings.serp_api_key),
+            "neo4j": False,
+            "redis": False
+        }
+        
+        # Test YC API
+        try:
+            async with DataSources() as ds:
+                yc_test = await ds.get_yc_companies(limit=1)
+                status["yc_api"] = len(yc_test) > 0
+        except:
+            pass
+        
+        # Test HN API
+        try:
+            async with DataSources() as ds:
+                hn_test = await ds.get_hacker_news_mentions("test", limit=1)
+                status["hacker_news"] = len(hn_test) > 0
+        except:
+            pass
+        
+        # Test Neo4j
+        try:
+            from database.connections import neo4j_conn
+            if neo4j_conn.driver:
+                with neo4j_conn.driver.session() as session:
+                    session.run("RETURN 1")
+                    status["neo4j"] = True
+        except:
+            pass
+        
+        # Test Redis
+        try:
+            from database.connections import redis_conn
+            if redis_conn.client:
+                redis_conn.client.ping()
+                status["redis"] = True
+        except:
+            pass
+        
+        all_healthy = all(status.values())
+        
+        return {
+            "success": True,
+            "overall_status": "healthy" if all_healthy else "partial",
+            "services": status
+        }
+        
+    except Exception as e:
+        logger.error(f"Data sources health check failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))

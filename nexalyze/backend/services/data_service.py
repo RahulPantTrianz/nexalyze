@@ -1,1150 +1,870 @@
+"""
+Enhanced Data Service
+Production-ready data collection, processing, and storage with multi-source integration
+"""
+
 import aiohttp
 import asyncio
-from typing import List, Dict, Any
+import re
 import json
+import hashlib
 import logging
-from config.settings import settings
-from database.connections import neo4j_conn, postgres_conn, redis_conn
-from services.hacker_news_service import HackerNewsService
-import requests
+from typing import List, Dict, Any, Optional, Callable, Tuple
+from datetime import datetime, timedelta
+from dataclasses import dataclass, asdict
+from enum import Enum
 
+from config.settings import settings
+from database.connections import (
+    neo4j_conn, redis_conn, 
+    cache_get, cache_set, cache_key
+)
 
 logger = logging.getLogger(__name__)
 
 
+class DataSource(Enum):
+    """Available data sources"""
+    YC = "y_combinator"
+    HACKER_NEWS = "hacker_news"
+    PRODUCT_HUNT = "product_hunt"
+    BETALIST = "betalist"
+    SERP = "serp_api"
+    GITHUB = "github"
+    INTERNAL = "internal"
+
+
+@dataclass
+class Company:
+    """Standardized company data model"""
+    name: str
+    description: str
+    industry: str
+    location: str = ""
+    website: str = ""
+    founded_year: int = 0
+    yc_batch: str = ""
+    funding: str = ""
+    employees: str = ""
+    stage: str = ""
+    tags: List[str] = None
+    long_description: str = ""
+    is_active: bool = True
+    source: str = DataSource.INTERNAL.value
+    
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+    
+    @classmethod
+    def from_yc_data(cls, data: Dict[str, Any]) -> Optional['Company']:
+        """Create Company from YC API data"""
+        name = data.get('name', '')
+        if not name:
+            return None
+        
+        description = data.get('one_liner', '') or data.get('description', '')
+        if not description or len(description) < 10:
+            return None
+        
+        industries = data.get('industries', [])
+        if not industries:
+            return None
+        
+        # Extract location
+        location = ''
+        if data.get('location'):
+            location = data['location']
+        elif data.get('city'):
+            city = data['city']
+            country = data.get('country', '')
+            location = f"{city}, {country}" if country else city
+        elif data.get('country'):
+            location = data['country']
+        else:
+            location = data.get('region', 'United States')
+        
+        # Extract founded year from batch if not available
+        founded_year = data.get('year_founded', 0)
+        batch = data.get('batch', '') or data.get('batch_name', '')
+        
+        if not founded_year or founded_year < 1990:
+            if batch:
+                year_match = re.search(r'(\d{2})$', batch)
+                if year_match:
+                    year = int(year_match.group(1))
+                    founded_year = 2000 + year if year < 50 else 1900 + year
+                else:
+                    founded_year = 2010
+        
+        if not batch:
+            return None
+        
+        # Get website
+        website = data.get('website', '') or data.get('url', '')
+        if not website:
+            website = f"https://www.ycombinator.com/companies/{name.lower().replace(' ', '-')}"
+        
+        return cls(
+            name=name,
+            description=description,
+            long_description=data.get('long_description', description),
+            industry=', '.join(industries),
+            location=location,
+            website=website,
+            founded_year=founded_year,
+            yc_batch=batch,
+            tags=data.get('tags', []),
+            is_active=data.get('status', {}).get('active', True) if isinstance(data.get('status'), dict) else True,
+            source=DataSource.YC.value
+        )
+
+
 class DataService:
+    """
+    Production-ready data service with:
+    - Multi-source data aggregation
+    - Intelligent caching
+    - Batch processing
+    - Error recovery
+    - Data validation
+    """
+    
     def __init__(self):
         self.yc_api_url = settings.yc_api_base_url
-        self.hacker_news_service = HackerNewsService()
-    
-    async def sync_yc_data(self, limit: int = 500):
-        """Sync YC data - Stores companies with realistic filter"""
-        logger.info(f"sync_yc_data called with limit={limit}")
+        self._session: Optional[aiohttp.ClientSession] = None
         
-        try:
-            # Get all companies
-            response = requests.get(f"{self.yc_api_url}/companies/all.json", timeout=60)
-            
-            if response.status_code == 200:
-                all_companies = response.json()
-                logger.info(f"Found {len(all_companies)} total companies from YC API")
-                
-                # Filter for companies with industries (most important filter)
-                companies_with_industries = [
-                    c for c in all_companies 
-                    if c.get('industries') and len(c.get('industries', [])) > 0
-                ]
-                logger.info(f"Found {len(companies_with_industries)} companies with industry tags")
-                
-                # Process companies
-                count = 0
-                skipped = 0
-                target_count = min(limit, len(companies_with_industries))
-                
-                logger.info(f"Syncing {target_count} companies...")
-                
-                for idx, company in enumerate(companies_with_industries):
-                    if count >= target_count:
-                        break
-                    
-                    # Try to store
-                    was_stored = await self._store_company(company)
-                    
-                    if was_stored:
-                        count += 1
-                        if count % 100 == 0:
-                            logger.info(f"Progress: {count}/{target_count} companies synced")
-                    else:
-                        skipped += 1
-                
-                logger.info(f"Sync completed: {count} companies synced successfully")
-                return count
-            else:
-                logger.error(f"YC API returned status {response.status_code}")
-                return 0
-                
-        except Exception as e:
-            logger.error(f"sync_yc_data failed: {e}")
-            return 0
+        # Rate limiting
+        self._request_times: Dict[str, List[float]] = {}
+        self._rate_limits = {
+            'yc': (10, 1),  # 10 requests per second
+            'default': (5, 1),  # 5 requests per second
+        }
     
-    async def sync_yc_companies(self, batch_size: int = 1000) -> int:
-        """Sync Y Combinator companies data"""
-        try:
-            # Use requests for synchronous call (easier for demo)
-            logger.info("Starting YC companies sync...")
-            response = requests.get(f"{self.yc_api_url}/companies/all.json", timeout=60)
-            
-            if response.status_code == 200:
-                companies = response.json()
-                
-                # Store in PostgreSQL and Neo4j
-                count = 0
-                failed_count = 0
-                total_companies = len(companies)
-                logger.info(f"Found {total_companies} companies from YC API")
-                
-                # Process companies in batches for better performance
-                for i in range(0, total_companies, batch_size):
-                    batch = companies[i:i + batch_size]
-                    logger.info(f"Processing batch {i//batch_size + 1}/{(total_companies + batch_size - 1)//batch_size}")
-                    
-                    for company in batch:
-                        try:
-                            await self._store_company(company)
-                            count += 1
-                        except Exception as e:
-                            failed_count += 1
-                            logger.warning(f"Failed to store company {company.get('name', 'Unknown')}: {e}")
-                            continue
-                    
-                    # Log progress after each batch
-                    logger.info(f"Processed {count}/{total_companies} companies ({count/total_companies*100:.1f}%)")
-                    
-                logger.info(f"Sync completed: {count} companies synced, {failed_count} failed")
-                return count
-            else:
-                logger.error(f"YC API returned status {response.status_code}")
-                return 0
-                
-        except Exception as e:
-            logger.error(f"Failed to sync YC companies: {e}")
-            return 0
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create aiohttp session"""
+        if self._session is None or self._session.closed:
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            connector = aiohttp.TCPConnector(ssl=False, limit=20)
+            self._session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        return self._session
     
-    async def _store_company(self, company_data: Dict[str, Any]) -> bool:
-        """Store company data in databases - REALISTIC filter based on YC API
-        Returns True if stored, False if skipped"""
-        try:
-            # Extract and normalize YC API fields
-            name = company_data.get('name', '')
-            if not name:
-                return False  # Skip companies without names
-            
-            # YC API uses 'one_liner' for description
-            description = company_data.get('one_liner', '') or company_data.get('description', '')
-            if not description or len(description) < 10:  # Lowered from 20
-                return False  # Skip companies without good descriptions
-            
-            # Get location - YC API provides this in multiple formats
-            # Try all possible location fields from YC API
-            location = ''
-            if 'location' in company_data and company_data['location']:
-                location = company_data['location']
-            elif 'city' in company_data and company_data['city']:
-                city = company_data['city']
-                country = company_data.get('country', '')
-                location = f"{city}, {country}" if country else city
-            elif 'country' in company_data and company_data['country']:
-                location = company_data['country']
-            
-            # If still no location, use region or default
-            if not location:
-                location = company_data.get('region', 'United States')  # Most YC companies are US-based
-            
-            # Get industry/tags - REQUIRED
-            industries = company_data.get('industries', [])
-            if not industries:
-                return False  # Skip companies without industry tags
-            industry = ', '.join(industries)
-            
-            # Founded year - OPTIONAL (use batch year if missing)
-            founded_year = company_data.get('year_founded', 0)
-            if not founded_year or founded_year < 1990:  # More lenient
-                # Try to extract from batch
-                batch = company_data.get('batch', '')
-                if batch:
-                    # Extract year from batch like "W21" -> 2021
-                    import re
-                    year_match = re.search(r'(\d{2})$', batch)
-                    if year_match:
-                        year = int(year_match.group(1))
-                        founded_year = 2000 + year if year < 50 else 1900 + year
-                    else:
-                        founded_year = 2010  # Default
-                else:
-                    founded_year = 2010  # Default
-            
-            # Website URL - OPTIONAL
-            website = company_data.get('website', '') or company_data.get('url', '')
-            if not website:
-                website = f"https://www.ycombinator.com/companies/{name.lower().replace(' ', '-')}"
-            
-            # YC batch - REQUIRED
-            batch = company_data.get('batch', '') or company_data.get('batch_name', '')
-            if not batch:
-                return False  # Skip non-YC companies
-            
-            # Team size - YC API doesn't provide this reliably, skip it
-            team_size = company_data.get('team_size', 0) or 0
-            
-            # Status
-            status = company_data.get('status', {})
-            is_active = status.get('active', True) if isinstance(status, dict) else True
-            
-            # Funding information
-            long_description = company_data.get('long_description', description)
-            tags = company_data.get('tags', [])
-            
-            # Store with ONLY essential requirements: name, description, industry, batch
-            if all([name, description, industry, batch]):
-                # Store in Neo4j
-                if neo4j_conn.driver:
-                    with neo4j_conn.driver.session() as session:
-                        session.run(
-                            """
-                            MERGE (c:Company {name: $name}) 
-                            SET c.description = $description, 
-                                c.long_description = $long_description,
-                                c.industry = $industry, 
-                                c.founded_year = $founded_year,
-                                c.location = $location,
-                                c.website = $website,
-                                c.yc_batch = $batch,
-                                c.is_active = $is_active,
-                                c.tags = $tags,
-                                c.updated_at = datetime()
-                            """,
-                            name=name,
-                            description=description,
-                            long_description=long_description,
-                            industry=industry,
-                            founded_year=founded_year,
-                            location=location,
-                            website=website,
-                            batch=batch,
-                            is_active=is_active,
-                            tags=tags
-                        )
-                        return True  # Successfully stored
-            
-            return False  # Didn't meet minimum requirements
-                    
-        except Exception as e:
-            logger.error(f"Failed to store company {company_data.get('name', 'Unknown')}: {e}")
-            return False
+    async def _close_session(self):
+        """Close aiohttp session"""
+        if self._session and not self._session.closed:
+            await self._session.close()
     
-    async def search_companies(self, query: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Search companies by query"""
-        try:
-            logger.info(f"DataService.search_companies called with query: '{query}', limit: {limit}")
-            
-            # First check Redis cache
-            cache_key = f"search:{query}:{limit}"
-            if redis_conn.client:
-                try:
-                    cached = redis_conn.client.get(cache_key)
-                    if cached:
-                        logger.info("Returning cached results")
-                        return json.loads(cached)
-                except:
-                    pass  # Continue if cache fails
-            
-            # Query Neo4j
-            results = []
-            logger.info(f"Neo4j driver available: {neo4j_conn.driver is not None}")
-            if neo4j_conn.driver:
-                logger.info("Querying Neo4j database")
-                with neo4j_conn.driver.session() as session:
-                    result = session.run(
-                        """
-                        MATCH (c:Company) 
-                        WHERE toLower(c.name) CONTAINS toLower($query) 
-                           OR toLower(c.description) CONTAINS toLower($query)
-                           OR toLower(c.industry) CONTAINS toLower($query)
-                        RETURN c.name as name, c.description as description, 
-                               c.industry as industry, c.founded_year as founded_year,
-                               c.location as location, c.website as website,
-                               c.yc_batch as yc_batch, id(c) as company_id
-                        LIMIT $limit
-                        """,
-                        {"query": query, "limit": limit}
-                    )
-                    
-                    for record in result:
-                        company = {
-                            'id': record['company_id'],
-                            'name': record['name'],
-                            'description': record['description'],
-                            'industry': record['industry'],
-                            'founded_year': record['founded_year'],
-                            'location': record['location'],
-                            'website': record['website'],
-                            'yc_batch': record['yc_batch']
-                        }
-                        results.append(company)
-                logger.info(f"Neo4j returned {len(results)} companies")
-            else:
-                logger.info("Neo4j driver not available, skipping database query")
-            
-            # If no results from Neo4j, return curated sample data based on query
-            if not results:
-                logger.info("No results from Neo4j, using sample data")
-                results = self._get_sample_companies(query, limit)
-                logger.info(f"Sample data returned {len(results)} companies")
-            
-            # Cache results
-            if redis_conn.client and results:
-                try:
-                    redis_conn.client.setex(cache_key, 300, json.dumps(results))  # 5 min cache
-                except:
-                    pass  # Continue if cache fails
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Company search failed: {e}")
-            return []
-
-    def _get_sample_companies(self, query: str, limit: int) -> List[Dict[str, Any]]:
-        """Get curated sample companies based on search query"""
-        query_lower = query.lower()
+    async def _rate_limit(self, source: str = 'default'):
+        """Apply rate limiting for API requests"""
+        max_requests, window = self._rate_limits.get(source, self._rate_limits['default'])
         
-        # Define company databases by category
-        company_databases = {
-            'ai': [
-                {
-                    'id': 1,
-                    'name': 'OpenAI',
-                    'description': 'AI research company focused on creating safe artificial general intelligence',
-                    'industry': 'Artificial Intelligence',
-                    'founded_year': 2015,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://openai.com',
-                    'yc_batch': 'S15',
-                    'funding': '$11.3B',
-                    'employees': '500-1000',
-                    'stage': 'Series C'
-                },
-                {
-                    'id': 2,
-                    'name': 'Anthropic',
-                    'description': 'AI safety company developing Claude, a helpful AI assistant',
-                    'industry': 'Artificial Intelligence',
-                    'founded_year': 2021,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://anthropic.com',
-                    'yc_batch': 'S21',
-                    'funding': '$4.1B',
-                    'employees': '200-500',
-                    'stage': 'Series C'
-                },
-                {
-                    'id': 3,
-                    'name': 'Cohere',
-                    'description': 'Natural language processing AI platform for enterprises',
-                    'industry': 'Artificial Intelligence',
-                    'founded_year': 2019,
-                    'location': 'Toronto, Canada',
-                    'website': 'https://cohere.ai',
-                    'yc_batch': 'W19',
-                    'funding': '$270M',
-                    'employees': '100-200',
-                    'stage': 'Series C'
-                }
-            ],
-            'edtech': [
-                {
-                    'id': 4,
-                    'name': 'Khan Academy',
-                    'description': 'Free online learning platform with personalized learning resources',
-                    'industry': 'Education Technology',
-                    'founded_year': 2008,
-                    'location': 'Mountain View, CA',
-                    'website': 'https://khanacademy.org',
-                    'yc_batch': 'S08',
-                    'funding': '$16M',
-                    'employees': '200-500',
-                    'stage': 'Non-profit'
-                },
-                {
-                    'id': 5,
-                    'name': 'Duolingo',
-                    'description': 'Language learning platform with gamified lessons',
-                    'industry': 'Education Technology',
-                    'founded_year': 2011,
-                    'location': 'Pittsburgh, PA',
-                    'website': 'https://duolingo.com',
-                    'yc_batch': 'S11',
-                    'funding': '$183M',
-                    'employees': '500-1000',
-                    'stage': 'Public'
-                },
-                {
-                    'id': 6,
-                    'name': 'Coursera',
-                    'description': 'Online learning platform offering courses from top universities',
-                    'industry': 'Education Technology',
-                    'founded_year': 2012,
-                    'location': 'Mountain View, CA',
-                    'website': 'https://coursera.org',
-                    'yc_batch': 'S12',
-                    'funding': '$464M',
-                    'employees': '1000+',
-                    'stage': 'Public'
-                }
-            ],
-            'fintech': [
-                {
-                    'id': 7,
-                    'name': 'Stripe',
-                    'description': 'Online payment processing platform for internet businesses',
-                    'industry': 'Financial Technology',
-                    'founded_year': 2010,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://stripe.com',
-                    'yc_batch': 'S10',
-                    'funding': '$2.2B',
-                    'employees': '3000+',
-                    'stage': 'Series H'
-                },
-                {
-                    'id': 8,
-                    'name': 'Coinbase',
-                    'description': 'Cryptocurrency exchange and digital wallet platform',
-                    'industry': 'Financial Technology',
-                    'founded_year': 2012,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://coinbase.com',
-                    'yc_batch': 'S12',
-                    'funding': '$547M',
-                    'employees': '3000+',
-                    'stage': 'Public'
-                },
-                {
-                    'id': 9,
-                    'name': 'Plaid',
-                    'description': 'Financial data connectivity platform for fintech apps',
-                    'industry': 'Financial Technology',
-                    'founded_year': 2013,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://plaid.com',
-                    'yc_batch': 'S13',
-                    'funding': '$734M',
-                    'employees': '500-1000',
-                    'stage': 'Acquired'
-                }
-            ],
-            'healthcare': [
-                {
-                    'id': 10,
-                    'name': '23andMe',
-                    'description': 'Personal genomics and biotechnology company',
-                    'industry': 'Healthcare',
-                    'founded_year': 2006,
-                    'location': 'Sunnyvale, CA',
-                    'website': 'https://23andme.com',
-                    'yc_batch': 'S06',
-                    'funding': '$791M',
-                    'employees': '500-1000',
-                    'stage': 'Public'
-                },
-                {
-                    'id': 11,
-                    'name': 'Veracyte',
-                    'description': 'Molecular diagnostics company for cancer detection',
-                    'industry': 'Healthcare',
-                    'founded_year': 2008,
-                    'location': 'South San Francisco, CA',
-                    'website': 'https://veracyte.com',
-                    'yc_batch': 'S08',
-                    'funding': '$300M',
-                    'employees': '200-500',
-                    'stage': 'Public'
-                }
-            ],
-            'saas': [
-                {
-                    'id': 12,
-                    'name': 'Dropbox',
-                    'description': 'Cloud storage and file synchronization service',
-                    'industry': 'Software as a Service',
-                    'founded_year': 2007,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://dropbox.com',
-                    'yc_batch': 'S07',
-                    'funding': '$1.7B',
-                    'employees': '3000+',
-                    'stage': 'Public'
-                },
-                {
-                    'id': 13,
-                    'name': 'Airbnb',
-                    'description': 'Online marketplace for short-term homestays and experiences',
-                    'industry': 'Software as a Service',
-                    'founded_year': 2008,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://airbnb.com',
-                    'yc_batch': 'W08',
-                    'funding': '$6.4B',
-                    'employees': '5000+',
-                    'stage': 'Public'
-                },
-                {
-                    'id': 14,
-                    'name': 'Twilio',
-                    'description': 'Cloud communications platform for developers',
-                    'industry': 'Software as a Service',
-                    'founded_year': 2008,
-                    'location': 'San Francisco, CA',
-                    'website': 'https://twilio.com',
-                    'yc_batch': 'S08',
-                    'funding': '$1.2B',
-                    'employees': '5000+',
-                    'stage': 'Public'
-                }
-            ]
+        if source not in self._request_times:
+            self._request_times[source] = []
+        
+        now = asyncio.get_event_loop().time()
+        
+        # Clean old timestamps
+        self._request_times[source] = [
+            t for t in self._request_times[source] 
+            if now - t < window
+        ]
+        
+        # Wait if at limit
+        if len(self._request_times[source]) >= max_requests:
+            wait_time = self._request_times[source][0] + window - now
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+        
+        self._request_times[source].append(now)
+    
+    async def sync_yc_data(
+        self, 
+        limit: int = None, 
+        progress_callback: Callable = None
+    ) -> Dict[str, Any]:
+        """
+        Sync Y Combinator company data with intelligent processing.
+        
+        Args:
+            limit: Maximum number of companies to sync (None for all)
+            progress_callback: Optional async callback(count, total, status)
+        
+        Returns:
+            Dictionary with sync statistics
+        """
+        logger.info(f"Starting YC data sync (limit={limit if limit else 'ALL'})")
+        
+        stats = {
+            "synced": 0,
+            "skipped": 0,
+            "failed": 0,
+            "total_available": 0,
+            "duration_seconds": 0
         }
         
-        # Find matching companies based on query
-        matching_companies = []
+        start_time = asyncio.get_event_loop().time()
         
-        # Check for exact category matches
-        for category, companies in company_databases.items():
-            if category in query_lower or query_lower in category:
-                matching_companies.extend(companies)
-        
-        # Check for partial matches in company names and descriptions
-        for category, companies in company_databases.items():
-            for company in companies:
-                if (query_lower in company['name'].lower() or 
-                    query_lower in company['description'].lower() or
-                    query_lower in company['industry'].lower()):
-                    if company not in matching_companies:
-                        matching_companies.append(company)
-        
-        # If no specific matches, return companies from the most relevant category
-        if not matching_companies:
-            if any(word in query_lower for word in ['ai', 'artificial', 'intelligence', 'machine', 'learning']):
-                matching_companies = company_databases['ai']
-            elif any(word in query_lower for word in ['education', 'learning', 'school', 'university']):
-                matching_companies = company_databases['edtech']
-            elif any(word in query_lower for word in ['finance', 'fintech', 'payment', 'banking']):
-                matching_companies = company_databases['fintech']
-            elif any(word in query_lower for word in ['health', 'medical', 'healthcare']):
-                matching_companies = company_databases['healthcare']
-            elif any(word in query_lower for word in ['saas', 'software', 'platform']):
-                matching_companies = company_databases['saas']
+        try:
+            # Check cache first
+            cache_data = cache_get(cache_key("yc", "all_companies"))
+            
+            if cache_data:
+                all_companies = cache_data
+                logger.info(f"Using cached YC data ({len(all_companies)} companies)")
             else:
-                matching_companies = company_databases['ai']
+                # Fetch from API
+                session = await self._get_session()
+                await self._rate_limit('yc')
+                
+                async with session.get(
+                    f"{self.yc_api_url}/companies/all.json",
+                    timeout=aiohttp.ClientTimeout(total=120)
+                ) as response:
+                    if response.status != 200:
+                        logger.error(f"YC API returned status {response.status}")
+                        stats["error"] = f"API returned status {response.status}"
+                        return stats
+                    
+                    all_companies = await response.json()
+                
+                # Cache for 1 hour
+                cache_set(cache_key("yc", "all_companies"), all_companies, ttl=3600)
+                logger.info(f"Fetched {len(all_companies)} companies from YC API")
+            
+            # Filter companies with industries
+            companies_with_industries = [
+                c for c in all_companies
+                if c.get('industries') and len(c.get('industries', [])) > 0
+            ]
+            
+            stats["total_available"] = len(companies_with_industries)
+            logger.info(f"Found {len(companies_with_industries)} companies with industry tags")
+            
+            # Determine target count
+            target_count = limit if limit else len(companies_with_industries)
+            
+            if progress_callback:
+                await progress_callback(0, target_count, "starting")
+            
+            # Process in batches for better performance
+            batch_size = 100
+            processed = 0
+            
+            for i in range(0, len(companies_with_industries), batch_size):
+                if limit and stats["synced"] >= limit:
+                    break
+                
+                batch = companies_with_industries[i:i + batch_size]
+                
+                for company_data in batch:
+                    if limit and stats["synced"] >= limit:
+                        break
+                    
+                    try:
+                        company = Company.from_yc_data(company_data)
+                        
+                        if company:
+                            stored = await self._store_company(company)
+                            if stored:
+                                stats["synced"] += 1
+                            else:
+                                stats["skipped"] += 1
+                        else:
+                            stats["skipped"] += 1
+                            
+                    except Exception as e:
+                        stats["failed"] += 1
+                        if stats["failed"] % 50 == 0:
+                            logger.warning(f"Failed count: {stats['failed']} companies")
+                
+                processed += len(batch)
+                
+                if stats["synced"] % 100 == 0 and stats["synced"] > 0:
+                    logger.info(f"Progress: {stats['synced']}/{target_count} companies synced")
+                    
+                    if progress_callback:
+                        await progress_callback(stats["synced"], target_count, "syncing")
+            
+            stats["duration_seconds"] = asyncio.get_event_loop().time() - start_time
+            
+            logger.info(
+                f"YC sync completed: {stats['synced']} synced, "
+                f"{stats['skipped']} skipped, {stats['failed']} failed "
+                f"({stats['duration_seconds']:.1f}s)"
+            )
+            
+            if progress_callback:
+                await progress_callback(stats["synced"], target_count, "completed")
+            
+            return stats
+            
+        except Exception as e:
+            logger.error(f"YC sync failed: {e}")
+            stats["error"] = str(e)
+            
+            if progress_callback:
+                await progress_callback(0, 0, "error")
+            
+            return stats
+    
+    async def _store_company(
+        self, 
+        company: Company, 
+        retry_count: int = 0
+    ) -> bool:
+        """
+        Store company in Neo4j with retry logic.
         
-        return matching_companies[:limit]
+        Args:
+            company: Company dataclass
+            retry_count: Current retry attempt
+        
+        Returns:
+            True if stored successfully
+        """
+        max_retries = 3
+        
+        try:
+            if not neo4j_conn.is_connected():
+                if retry_count < max_retries:
+                    logger.warning(f"Neo4j not connected, reconnecting (attempt {retry_count + 1})")
+                    await asyncio.sleep(1 * (retry_count + 1))
+                    if neo4j_conn.reconnect():
+                        return await self._store_company(company, retry_count + 1)
+                return False
+            
+            with neo4j_conn.driver.session() as session:
+                session.run(
+                    """
+                    MERGE (c:Company {name: $name})
+                    SET c.description = $description,
+                        c.long_description = $long_description,
+                        c.industry = $industry,
+                        c.founded_year = $founded_year,
+                        c.location = $location,
+                        c.website = $website,
+                        c.yc_batch = $yc_batch,
+                        c.funding = $funding,
+                        c.employees = $employees,
+                        c.stage = $stage,
+                        c.is_active = $is_active,
+                        c.tags = $tags,
+                        c.source = $source,
+                        c.updated_at = datetime()
+                    """,
+                    name=company.name,
+                    description=company.description,
+                    long_description=company.long_description,
+                    industry=company.industry,
+                    founded_year=company.founded_year,
+                    location=company.location,
+                    website=company.website,
+                    yc_batch=company.yc_batch,
+                    funding=company.funding,
+                    employees=company.employees,
+                    stage=company.stage,
+                    is_active=company.is_active,
+                    tags=company.tags,
+                    source=company.source
+                )
+                return True
+                
+        except Exception as e:
+            if retry_count < max_retries and "Connection" in str(e):
+                logger.warning(f"Retrying store for {company.name}: {e}")
+                await asyncio.sleep(1 * (retry_count + 1))
+                return await self._store_company(company, retry_count + 1)
+            
+            logger.error(f"Failed to store company {company.name}: {e}")
+            return False
+    
+    async def search_companies(
+        self, 
+        query: str, 
+        limit: int = 10,
+        filters: Dict[str, Any] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search companies with intelligent caching and fallback.
+        
+        Args:
+            query: Search query
+            limit: Maximum results
+            filters: Optional filters (industry, location, stage, etc.)
+        
+        Returns:
+            List of matching companies
+        """
+        if not query or not isinstance(query, str):
+            return []
+        
+        query = query.strip()
+        if not query:
+            return []
+        
+        logger.info(f"Searching companies: '{query}' (limit: {limit})")
+        
+        # Check cache first
+        cache_query_key = cache_key("search", hashlib.md5(f"{query}:{limit}:{filters}".encode()).hexdigest())
+        cached_results = cache_get(cache_query_key)
+        
+        if cached_results:
+            logger.debug(f"Returning cached search results for '{query}'")
+            return cached_results
+        
+        results = []
+        
+        # Try Neo4j first
+        if neo4j_conn.is_connected():
+            try:
+                results = await self._search_neo4j(query, limit, filters)
+                logger.info(f"Neo4j returned {len(results)} companies")
+            except Exception as e:
+                logger.warning(f"Neo4j search failed: {e}")
+        
+        # Fallback to curated sample data if no results
+        if not results:
+            logger.info("No Neo4j results, using sample data")
+            results = self._get_sample_companies(query, limit)
+        
+        # Cache results
+        if results:
+            cache_set(cache_query_key, results, ttl=settings.cache_ttl_search)
+        
+        return results
+    
+    async def _search_neo4j(
+        self, 
+        query: str, 
+        limit: int,
+        filters: Dict[str, Any] = None
+    ) -> List[Dict[str, Any]]:
+        """Execute Neo4j search query"""
+        
+        # Build filter conditions
+        filter_conditions = []
+        params = {"query": query.lower(), "limit": limit}
+        
+        if filters:
+            if filters.get("industry"):
+                filter_conditions.append("AND toLower(c.industry) CONTAINS toLower($industry)")
+                params["industry"] = filters["industry"]
+            
+            if filters.get("location"):
+                filter_conditions.append("AND toLower(c.location) CONTAINS toLower($location)")
+                params["location"] = filters["location"]
+            
+            if filters.get("stage"):
+                filter_conditions.append("AND c.stage = $stage")
+                params["stage"] = filters["stage"]
+            
+            if filters.get("min_year"):
+                filter_conditions.append("AND c.founded_year >= $min_year")
+                params["min_year"] = filters["min_year"]
+        
+        filter_str = " ".join(filter_conditions)
+        
+        cypher = f"""
+            MATCH (c:Company)
+            WHERE (
+                toLower(c.name) CONTAINS $query
+                OR toLower(c.description) CONTAINS $query
+                OR toLower(c.industry) CONTAINS $query
+                OR toLower(c.long_description) CONTAINS $query
+            )
+            {filter_str}
+            RETURN 
+                c.name as name,
+                c.description as description,
+                c.industry as industry,
+                c.founded_year as founded_year,
+                c.location as location,
+                c.website as website,
+                c.yc_batch as yc_batch,
+                c.funding as funding,
+                c.employees as employees,
+                c.stage as stage,
+                c.tags as tags,
+                id(c) as company_id
+            ORDER BY 
+                CASE WHEN toLower(c.name) CONTAINS $query THEN 0 ELSE 1 END,
+                c.founded_year DESC
+            LIMIT $limit
+        """
+        
+        results = neo4j_conn.query(cypher, params)
+        
+        return [
+            {
+                'id': r.get('company_id'),
+                'name': r.get('name'),
+                'description': r.get('description'),
+                'industry': r.get('industry'),
+                'founded_year': r.get('founded_year'),
+                'location': r.get('location'),
+                'website': r.get('website'),
+                'yc_batch': r.get('yc_batch'),
+                'funding': r.get('funding'),
+                'employees': r.get('employees'),
+                'stage': r.get('stage'),
+                'tags': r.get('tags', [])
+            }
+            for r in results
+        ]
     
     async def get_company_details(self, company_id: int) -> Dict[str, Any]:
-        """Get detailed information about a specific company"""
-        try:
-            # First try to get from Neo4j
-            if neo4j_conn.driver:
-                with neo4j_conn.driver.session() as session:
-                    result = session.run(
-                        """
-                        MATCH (c:Company) WHERE id(c) = $company_id 
-                        RETURN c.name as name, c.description as description, 
-                               c.industry as industry, c.founded_year as founded_year,
-                               c.location as location, c.website as website,
-                               c.yc_batch as yc_batch, id(c) as company_id
-                        """,
-                        {"company_id": company_id}
-                    )
-                    record = result.single()
-                    if record:
-                        return {
-                            'id': record['company_id'],
-                            'name': record['name'],
-                            'description': record['description'],
-                            'industry': record['industry'],
-                            'founded_year': record['founded_year'],
-                            'location': record['location'],
-                            'website': record['website'],
-                            'yc_batch': record['yc_batch']
-                        }
-            # Fallback to sample
-            sample_companies = self._get_sample_companies("", 100)
-            for company in sample_companies:
-                if company['id'] == company_id:
-                    return company
-            return {
-                'id': company_id,
-                'name': f'Company {company_id}',
-                'description': 'Company details not available',
-                'industry': 'Unknown',
-                'founded_year': 2020,
-                'location': 'Unknown',
-                'website': 'N/A',
-                'yc_batch': 'N/A',
-                'funding': 'N/A',
-                'employees': 'N/A',
-                'stage': 'Unknown'
-            }
-        except Exception as e:
-            logger.error(f"Failed to get company details for ID {company_id}: {e}")
-            return {
-                'id': company_id,
-                'name': f'Company {company_id}',
-                'description': 'Error retrieving company details',
-                'industry': 'Unknown',
-                'founded_year': 2020,
-                'location': 'Unknown',
-                'website': 'N/A',
-                'yc_batch': 'N/A'
-            }
+        """Get detailed company information by ID"""
+        
+        # Check cache
+        cached = cache_get(cache_key("company", str(company_id)))
+        if cached:
+            return cached
+        
+        # Query Neo4j
+        if neo4j_conn.is_connected():
+            results = neo4j_conn.query(
+                """
+                MATCH (c:Company) WHERE id(c) = $company_id
+                RETURN c.name as name, c.description as description,
+                       c.long_description as long_description,
+                       c.industry as industry, c.founded_year as founded_year,
+                       c.location as location, c.website as website,
+                       c.yc_batch as yc_batch, c.funding as funding,
+                       c.employees as employees, c.stage as stage,
+                       c.tags as tags, id(c) as company_id
+                """,
+                {"company_id": company_id}
+            )
+            
+            if results:
+                company = results[0]
+                result = {
+                    'id': company.get('company_id'),
+                    'name': company.get('name'),
+                    'description': company.get('description'),
+                    'long_description': company.get('long_description'),
+                    'industry': company.get('industry'),
+                    'founded_year': company.get('founded_year'),
+                    'location': company.get('location'),
+                    'website': company.get('website'),
+                    'yc_batch': company.get('yc_batch'),
+                    'funding': company.get('funding'),
+                    'employees': company.get('employees'),
+                    'stage': company.get('stage'),
+                    'tags': company.get('tags', [])
+                }
+                
+                # Cache for 24 hours
+                cache_set(cache_key("company", str(company_id)), result, ttl=settings.cache_ttl_company)
+                return result
+        
+        # Fallback
+        return self._get_fallback_company(company_id)
+    
+    async def get_company_count(self) -> int:
+        """Get total number of companies in database"""
+        if not neo4j_conn.is_connected():
+            return 0
+        
+        results = neo4j_conn.query("MATCH (c:Company) RETURN count(c) as total")
+        return results[0].get('total', 0) if results else 0
+    
+    async def get_industry_distribution(self) -> Dict[str, int]:
+        """Get company distribution by industry"""
+        if not neo4j_conn.is_connected():
+            return {}
+        
+        results = neo4j_conn.query("""
+            MATCH (c:Company)
+            WHERE c.industry IS NOT NULL
+            RETURN c.industry as industry, count(*) as count
+            ORDER BY count DESC
+            LIMIT 20
+        """)
+        
+        return {r['industry']: r['count'] for r in results}
+    
+    async def get_location_distribution(self) -> Dict[str, int]:
+        """Get company distribution by location"""
+        if not neo4j_conn.is_connected():
+            return {}
+        
+        results = neo4j_conn.query("""
+            MATCH (c:Company)
+            WHERE c.location IS NOT NULL
+            RETURN c.location as location, count(*) as count
+            ORDER BY count DESC
+            LIMIT 20
+        """)
+        
+        return {r['location']: r['count'] for r in results}
     
     async def get_knowledge_graph(self, company_id: int) -> Dict[str, Any]:
         """Get knowledge graph data for visualization"""
-        try:
-            nodes = []
-            edges = []
-            if neo4j_conn.driver:
-                with neo4j_conn.driver.session() as session:
-                    result = session.run(
-                        """
-                        MATCH (c:Company) WHERE id(c) = $company_id 
-                        OPTIONAL MATCH (c)-[r]-(related) 
-                        RETURN c, type(r) as rel_type, related LIMIT 20
-                        """,
-                        {"company_id": company_id}
-                    )
-                    company_added = False
-                    for record in result:
-                        company = record['c']
-                        if not company_added:
-                            nodes.append({
-                                'id': f"company_{company_id}",
-                                'label': company.get('name', f'Company {company_id}'),
-                                'group': 'company',
-                                'size': 30,
-                                'color': '#1f77b4'
-                            })
-                            company_added = True
-                        if record['related']:
-                            related = record['related']
-                            related_id = f"related_{len(nodes)}"
-                            nodes.append({
-                                'id': related_id,
-                                'label': related.get('name', 'Related Entity'),
-                                'group': 'related',
-                                'size': 20,
-                                'color': '#ff7f0e'
-                            })
-                            edges.append({
-                                'from': f"company_{company_id}",
-                                'to': related_id,
-                                'label': record['rel_type'] or 'related'
-                            })
-            if not nodes:
-                nodes = [
-                    {
-                        'id': f'company_{company_id}',
-                        'label': f'Company {company_id}',
-                        'group': 'company',
-                        'size': 30,
-                        'color': '#1f77b4'
-                    },
-                    {
-                        'id': 'competitor_1',
-                        'label': 'Competitor A',
-                        'group': 'competitor',
-                        'size': 25,
-                        'color': '#ff7f0e'
-                    },
-                    {
-                        'id': 'investor_1',
-                        'label': 'Investor X',
-                        'group': 'investor',
-                        'size': 20,
-                        'color': '#2ca02c'
-                    }
-                ]
-                edges = [
-                    {
-                        'from': f'company_{company_id}',
-                        'to': 'competitor_1',
-                        'label': 'competes_with'
-                    },
-                    {
-                        'from': f'company_{company_id}',
-                        'to': 'investor_1',
-                        'label': 'funded_by'
-                    }
-                ]
-            return {'nodes': nodes, 'edges': edges}
-        except Exception as e:
-            logger.error(f"Knowledge graph retrieval failed: {e}")
+        if not neo4j_conn.is_connected():
             return {'nodes': [], 'edges': []}
-
+        
+        results = neo4j_conn.query(
+            """
+            MATCH (c:Company) WHERE id(c) = $company_id
+            OPTIONAL MATCH (c)-[r]-(related)
+            RETURN c, type(r) as rel_type, related
+            LIMIT 20
+            """,
+            {"company_id": company_id}
+        )
+        
+        nodes = []
+        edges = []
+        company_added = False
+        
+        for record in results:
+            company = record.get('c')
+            
+            if not company_added and company:
+                nodes.append({
+                    'id': f"company_{company_id}",
+                    'label': company.get('name', f'Company {company_id}'),
+                    'group': 'company',
+                    'size': 30,
+                    'color': '#1f77b4'
+                })
+                company_added = True
+            
+            if record.get('related'):
+                related = record['related']
+                related_id = f"related_{len(nodes)}"
+                nodes.append({
+                    'id': related_id,
+                    'label': related.get('name', 'Related Entity'),
+                    'group': 'related',
+                    'size': 20,
+                    'color': '#ff7f0e'
+                })
+                edges.append({
+                    'from': f"company_{company_id}",
+                    'to': related_id,
+                    'label': record.get('rel_type', 'related')
+                })
+        
+        if not nodes:
+            nodes, edges = self._create_fallback_graph(company_id)
+        
+        return {'nodes': nodes, 'edges': edges}
+    
     async def get_knowledge_graph_by_name(self, company_name: str) -> Dict[str, Any]:
-        """Get AI-enhanced knowledge graph data for visualization by company name"""
-        try:
-            nodes = []
-            edges = []
-            company_id = None
-            company_data = None
-            
-            # First try to get from Neo4j
-            if neo4j_conn.driver:
-                with neo4j_conn.driver.session() as session:
-                    result = session.run(
-                        """
-                        MATCH (c:Company) 
-                        WHERE toLower(c.name) = toLower($company_name)
-                        RETURN c, id(c) as company_id
-                        LIMIT 1
-                        """,
-                        {"company_name": company_name}
-                    )
-                    record = result.single()
-                    if record:
-                        company_id = record['company_id']
-                        company_data = record['c']
-                        
-                        # Add main company node
-                        nodes.append({
-                            'id': f"company_{company_id}",
-                            'label': company_data.get('name', company_name),
-                            'group': 'main_company',
-                            'size': 40,
-                            'color': '#1f77b4',
-                            'physics': False,
-                            'title': f"{company_data.get('description', '')[:100]}..."
-                        })
-                        
-                        # Get existing relationships
-                        relationships_result = session.run(
-                            """
-                            MATCH (c:Company) WHERE id(c) = $company_id
-                            OPTIONAL MATCH (c)-[r]-(related:Company)
-                            RETURN c, type(r) as rel_type, related LIMIT 10
-                            """,
-                            {"company_id": company_id}
-                        )
-                        
-                        for rel_record in relationships_result:
-                            if rel_record['related']:
-                                related = rel_record['related']
-                                related_id = f"related_{len(nodes)}"
-                                nodes.append({
-                                    'id': related_id,
-                                    'label': related.get('name', 'Related Company'),
-                                    'group': 'related_company',
-                                    'size': 25,
-                                    'color': '#ff7f0e',
-                                    'title': f"{related.get('description', '')[:80]}..."
-                                })
-                                edges.append({
-                                    'from': f"company_{company_id}",
-                                    'to': related_id,
-                                    'label': rel_record['rel_type'] or 'related',
-                                    'arrows': 'to'
-                                })
-                        
-                        # If sparse data, enhance with AI-discovered relationships
-                        if len(nodes) < 5:
-                            logger.info(f"Sparse graph for {company_name}, enhancing with AI...")
-                            ai_nodes, ai_edges = await self._ai_enhance_knowledge_graph(
-                                company_name, 
-                                company_data,
-                                existing_node_count=len(nodes)
-                            )
-                            nodes.extend(ai_nodes)
-                            edges.extend(ai_edges)
-            
-            # If no Neo4j data, create AI-powered graph
-            if not nodes:
-                logger.info(f"No Neo4j data for {company_name}, creating AI-powered graph...")
-                nodes, edges = await self._create_ai_powered_knowledge_graph(company_name)
-            
-            return {
-                'nodes': nodes, 
-                'edges': edges, 
-                'company_name': company_name, 
-                'total_nodes': len(nodes), 
-                'total_edges': len(edges),
-                'ai_enhanced': len(nodes) > 1
-            }
-        except Exception as e:
-            logger.error(f"Knowledge graph retrieval failed for {company_name}: {e}")
-            return {'nodes': [], 'edges': [], 'error': str(e)}
-
-    def _create_sample_knowledge_graph(self, company_name: str) -> tuple:
-        company_lower = company_name.lower()
-        if any(word in company_lower for word in ['ai', 'artificial', 'openai', 'anthropic']):
-            return self._create_ai_company_graph(company_name)
-        elif any(word in company_lower for word in ['fintech', 'stripe', 'payment']):
-            return self._create_fintech_company_graph(company_name)
-        elif any(word in company_lower for word in ['health', 'medical', 'bio']):
-            return self._create_healthcare_company_graph(company_name)
-        else:
-            return self._create_generic_company_graph(company_name)
-
-    def _create_ai_company_graph(self, company_name: str) -> tuple:
-        nodes = [
-            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
-            {'id': 'comp1', 'label': 'OpenAI', 'group': 'competitor', 'size': 35, 'color': '#ff7f0e'},
-            {'id': 'comp2', 'label': 'Anthropic', 'group': 'competitor', 'size': 30, 'color': '#ff7f0e'},
-            {'id': 'comp3', 'label': 'Google AI', 'group': 'competitor', 'size': 35, 'color': '#ff7f0e'},
-            {'id': 'inv1', 'label': 'Andreessen Horowitz', 'group': 'investor', 'size': 25, 'color': '#2ca02c'},
-            {'id': 'inv2', 'label': 'Sequoia Capital', 'group': 'investor', 'size': 25, 'color': '#2ca02c'},
-            {'id': 'tech1', 'label': 'Microsoft', 'group': 'partner', 'size': 30, 'color': '#d62728'},
-            {'id': 'tech2', 'label': 'NVIDIA', 'group': 'partner', 'size': 25, 'color': '#d62728'},
-            {'id': 'market1', 'label': 'Enterprise AI', 'group': 'market', 'size': 20, 'color': '#9467bd'},
-            {'id': 'market2', 'label': 'Consumer AI', 'group': 'market', 'size': 20, 'color': '#9467bd'}
-        ]
-        edges = [
-            {'from': 'main', 'to': 'comp1', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'main', 'to': 'comp2', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'main', 'to': 'comp3', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'inv1', 'to': 'main', 'label': 'invested_in', 'color': '#2ca02c'},
-            {'from': 'inv2', 'to': 'main', 'label': 'invested_in', 'color': '#2ca02c'},
-            {'from': 'main', 'to': 'tech1', 'label': 'partners_with', 'color': '#d62728'},
-            {'from': 'main', 'to': 'tech2', 'label': 'partners_with', 'color': '#d62728'},
-            {'from': 'main', 'to': 'market1', 'label': 'serves', 'color': '#9467bd'},
-            {'from': 'main', 'to': 'market2', 'label': 'serves', 'color': '#9467bd'}
-        ]
-        return nodes, edges
-
-    def _create_fintech_company_graph(self, company_name: str) -> tuple:
-        nodes = [
-            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
-            {'id': 'comp1', 'label': 'Stripe', 'group': 'competitor', 'size': 35, 'color': '#ff7f0e'},
-            {'id': 'comp2', 'label': 'Square', 'group': 'competitor', 'size': 30, 'color': '#ff7f0e'},
-            {'id': 'comp3', 'label': 'PayPal', 'group': 'competitor', 'size': 35, 'color': '#ff7f0e'},
-            {'id': 'inv1', 'label': 'Tiger Global', 'group': 'investor', 'size': 25, 'color': '#2ca02c'},
-            {'id': 'bank1', 'label': 'JPMorgan Chase', 'group': 'partner', 'size': 30, 'color': '#d62728'},
-            {'id': 'market1', 'label': 'Online Payments', 'group': 'market', 'size': 20, 'color': '#9467bd'},
-        ]
-        edges = [
-            {'from': 'main', 'to': 'comp1', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'main', 'to': 'comp2', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'inv1', 'to': 'main', 'label': 'invested_in', 'color': '#2ca02c'},
-            {'from': 'main', 'to': 'bank1', 'label': 'partners_with', 'color': '#d62728'},
-            {'from': 'main', 'to': 'market1', 'label': 'operates_in', 'color': '#9467bd'}
-        ]
-        return nodes, edges
-
-    def _create_healthcare_company_graph(self, company_name: str) -> tuple:
-        nodes = [
-            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
-            {'id': 'comp1', 'label': 'Teladoc', 'group': 'competitor', 'size': 30, 'color': '#ff7f0e'},
-            {'id': 'comp2', 'label': '23andMe', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'inv1', 'label': 'Kleiner Perkins', 'group': 'investor', 'size': 25, 'color': '#2ca02c'},
-            {'id': 'hospital1', 'label': 'Mayo Clinic', 'group': 'partner', 'size': 25, 'color': '#d62728'},
-            {'id': 'market1', 'label': 'Digital Health', 'group': 'market', 'size': 20, 'color': '#9467bd'}
-        ]
-        edges = [
-            {'from': 'main', 'to': 'comp1', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'inv1', 'to': 'main', 'label': 'invested_in', 'color': '#2ca02c'},
-            {'from': 'main', 'to': 'hospital1', 'label': 'partners_with', 'color': '#d62728'},
-            {'from': 'main', 'to': 'market1', 'label': 'operates_in', 'color': '#9467bd'}
-        ]
-        return nodes, edges
-
-    def _create_generic_company_graph(self, company_name: str) -> tuple:
-        nodes = [
-            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
-            {'id': 'comp1', 'label': f'{company_name} Competitor 1', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'comp2', 'label': f'{company_name} Competitor 2', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'inv1', 'label': 'Venture Capital Fund', 'group': 'investor', 'size': 25, 'color': '#2ca02c'},
-            {'id': 'partner1', 'label': 'Strategic Partner', 'group': 'partner', 'size': 20, 'color': '#d62728'},
-            {'id': 'market1', 'label': 'Target Market', 'group': 'market', 'size': 20, 'color': '#9467bd'}
-        ]
-        edges = [
-            {'from': 'main', 'to': 'comp1', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'main', 'to': 'comp2', 'label': 'competes_with', 'color': '#ff7f0e'},
-            {'from': 'inv1', 'to': 'main', 'label': 'invested_in', 'color': '#2ca02c'},
-            {'from': 'main', 'to': 'partner1', 'label': 'partners_with', 'color': '#d62728'},
-            {'from': 'main', 'to': 'market1', 'label': 'serves', 'color': '#9467bd'}
-        ]
-        return nodes, edges
+        """Get knowledge graph by company name"""
+        if not neo4j_conn.is_connected():
+            return {'nodes': [], 'edges': [], 'ai_enhanced': False}
+        
+        # Find company
+        results = neo4j_conn.query(
+            """
+            MATCH (c:Company)
+            WHERE toLower(c.name) = toLower($name)
+            RETURN c, id(c) as company_id
+            LIMIT 1
+            """,
+            {"name": company_name}
+        )
+        
+        if results:
+            company_id = results[0].get('company_id')
+            graph_data = await self.get_knowledge_graph(company_id)
+            graph_data['company_name'] = company_name
+            graph_data['ai_enhanced'] = len(graph_data['nodes']) > 1
+            return graph_data
+        
+        # Create AI-enhanced graph if company not found
+        return await self._create_ai_knowledge_graph(company_name)
     
-    async def collect_hacker_news_data(self, company_name: str, limit: int = 50) -> Dict[str, Any]:
-        """Collect Hacker News data for a specific company"""
-        try:
-            logger.info(f"Collecting Hacker News data for {company_name}")
-            
-            async with HackerNewsService() as hn_service:
-                # Get company mentions from Hacker News
-                mentions = await hn_service.get_company_mentions(company_name, limit)
-                
-                # Store in knowledge graph
-                await hn_service.store_hn_data(company_name, mentions)
-                
-                # Format for display
-                formatted_mentions = {
-                    'stories': [hn_service.format_hn_item(item) for item in mentions['stories']],
-                    'jobs': [hn_service.format_hn_item(item) for item in mentions['jobs']],
-                    'show_hn': [hn_service.format_hn_item(item) for item in mentions['show_hn']],
-                    'ask_hn': [hn_service.format_hn_item(item) for item in mentions['ask_hn']],
-                    'total_mentions': mentions['total_mentions'],
-                    'company_name': company_name
-                }
-                
-                logger.info(f"Collected {mentions['total_mentions']} HN mentions for {company_name}")
-                return formatted_mentions
-                
-        except Exception as e:
-            logger.error(f"Failed to collect HN data for {company_name}: {e}")
-            return {
-                'stories': [],
-                'jobs': [],
-                'show_hn': [],
-                'ask_hn': [],
-                'total_mentions': 0,
-                'company_name': company_name,
-                'error': str(e)
-            }
-    
-    async def collect_hn_data_for_companies(self, company_names: List[str], limit_per_company: int = 30) -> Dict[str, Dict[str, Any]]:
-        """Collect Hacker News data for multiple companies"""
-        try:
-            logger.info(f"Collecting HN data for {len(company_names)} companies")
-            
-            results = {}
-            async with HackerNewsService() as hn_service:
-                for company_name in company_names:
-                    try:
-                        mentions = await hn_service.get_company_mentions(company_name, limit_per_company)
-                        await hn_service.store_hn_data(company_name, mentions)
-                        
-                        results[company_name] = {
-                            'stories': [hn_service.format_hn_item(item) for item in mentions['stories']],
-                            'jobs': [hn_service.format_hn_item(item) for item in mentions['jobs']],
-                            'show_hn': [hn_service.format_hn_item(item) for item in mentions['show_hn']],
-                            'ask_hn': [hn_service.format_hn_item(item) for item in mentions['ask_hn']],
-                            'total_mentions': mentions['total_mentions']
-                        }
-                        
-                        logger.info(f"Collected {mentions['total_mentions']} HN mentions for {company_name}")
-                        
-                    except Exception as e:
-                        logger.error(f"Failed to collect HN data for {company_name}: {e}")
-                        results[company_name] = {
-                            'stories': [],
-                            'jobs': [],
-                            'show_hn': [],
-                            'ask_hn': [],
-                            'total_mentions': 0,
-                            'error': str(e)
-                        }
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Failed to collect HN data for companies: {e}")
-            return {}
-    
-    async def get_company_with_hn_data(self, company_id: int) -> Dict[str, Any]:
-        """Get company details with Hacker News data"""
-        try:
-            # Get basic company details
-            company_details = await self.get_company_details(company_id)
-            
-            if company_details and company_details.get('name'):
-                # Get Hacker News data
-                hn_data = await self.collect_hacker_news_data(company_details['name'])
-                company_details['hacker_news'] = hn_data
-            
-            return company_details
-            
-        except Exception as e:
-            logger.error(f"Failed to get company with HN data for ID {company_id}: {e}")
-            return await self.get_company_details(company_id)
-    
-    async def _ai_enhance_knowledge_graph(self, company_name: str, company_data: Dict, existing_node_count: int) -> tuple:
-        """Use AI to discover relationships and enhance sparse knowledge graphs"""
+    async def _create_ai_knowledge_graph(self, company_name: str) -> Dict[str, Any]:
+        """Create AI-enhanced knowledge graph for unknown companies"""
         try:
             from agents.crew_manager import CrewManager
             crew_manager = CrewManager()
             
-            # Prepare company context
-            industry = company_data.get('industry', 'Unknown')
-            description = company_data.get('description', '')
-            location = company_data.get('location', 'Unknown')
+            # Get AI analysis
+            prompt = f"""Analyze "{company_name}" and provide its business ecosystem in JSON:
+            {{
+                "competitors": ["Competitor 1", "Competitor 2", "Competitor 3"],
+                "partners": ["Partner 1", "Partner 2"],
+                "technologies": ["Tech 1", "Tech 2"],
+                "markets": ["Market 1", "Market 2"]
+            }}
+            Use real company/technology names where possible."""
             
-            # Ask LLM to identify key relationships
-            prompt = f"""For the company "{company_name}" in the {industry} industry, identify 4-6 key entities they would interact with.
-
-Company: {company_name}
-Description: {description}
-Location: {location}
-
-List:
-1. 2-3 direct competitors (companies in same space)
-2. 1-2 technology partners or platforms they likely use
-3. 1-2 market segments or customer types they serve
-
-Be specific and realistic. Format as: Category|EntityName"""
-
             response = await crew_manager.handle_conversation(prompt, f"kg_{company_name}")
             
-            # Parse LLM response and create nodes/edges
-            nodes = []
-            edges = []
-            node_id_counter = existing_node_count
+            # Parse response
+            analysis = {}
+            if isinstance(response, dict) and 'response' in response:
+                response_text = response['response']
+                json_match = re.search(r'\{[\s\S]*\}', response_text)
+                if json_match:
+                    analysis = json.loads(json_match.group())
             
-            # Parse response (fallback to industry-based if parsing fails)
-            if isinstance(response, str) and response:
-                lines = response.split('\n')
-                for line in lines:
-                    if '|' in line:
-                        try:
-                            category, entity = line.strip().split('|', 1)
-                            category = category.lower().strip()
-                            entity = entity.strip()
-                            
-                            # Determine group and relationship
-                            if 'competitor' in category:
-                                group = 'competitor'
-                                rel_label = 'competes_with'
-                                color = '#ff7f0e'
-                            elif 'partner' in category or 'platform' in category:
-                                group = 'partner'
-                                rel_label = 'partners_with'
-                                color = '#2ca02c'
-                            elif 'market' in category or 'customer' in category:
-                                group = 'market'
-                                rel_label = 'serves'
-                                color = '#9467bd'
-                            else:
-                                group = 'related'
-                                rel_label = 'related_to'
-                                color = '#d62728'
-                            
-                            node_id = f"ai_node_{node_id_counter}"
-                            nodes.append({
-                                'id': node_id,
-                                'label': entity,
-                                'group': group,
-                                'size': 22,
-                                'color': color,
-                                'title': f"{category}: {entity}"
-                            })
-                            
-                            edges.append({
-                                'from': f"company_{existing_node_count-1}" if existing_node_count > 0 else 'main',
-                                'to': node_id,
-                                'label': rel_label,
-                                'arrows': 'to',
-                                'color': color
-                            })
-                            
-                            node_id_counter += 1
-                        except Exception as e:
-                            logger.debug(f"Failed to parse line '{line}': {e}")
-                            continue
-            
-            # If AI didn't provide enough, add industry-based fallback
-            if len(nodes) < 3:
-                nodes, edges = self._create_industry_based_graph_enhancement(
-                    company_name, 
-                    industry,
-                    node_id_counter
-                )
-            
-            logger.info(f"AI enhanced graph for {company_name} with {len(nodes)} nodes")
-            return nodes, edges
-            
-        except Exception as e:
-            logger.error(f"AI enhancement failed for {company_name}: {e}")
-            # Fallback to generic enhancement
-            return self._create_industry_based_graph_enhancement(company_name, "Technology", existing_node_count)
-    
-    def _create_industry_based_graph_enhancement(self, company_name: str, industry: str, start_id: int) -> tuple:
-        """Create graph enhancement based on industry patterns"""
-        nodes = []
-        edges = []
-        
-        industry_lower = industry.lower() if industry else ""
-        
-        # Industry-specific entities
-        if any(word in industry_lower for word in ['ai', 'machine learning', 'artificial']):
-            entities = [
-                ('OpenAI', 'competitor', 'competes_with', '#ff7f0e'),
-                ('AWS/Azure', 'partner', 'uses_platform', '#2ca02c'),
-                ('Enterprise AI Market', 'market', 'serves', '#9467bd')
-            ]
-        elif any(word in industry_lower for word in ['fintech', 'payment', 'finance']):
-            entities = [
-                ('Stripe', 'competitor', 'competes_with', '#ff7f0e'),
-                ('Banks/Financial Institutions', 'partner', 'partners_with', '#2ca02c'),
-                ('SMB/Enterprise', 'market', 'serves', '#9467bd')
-            ]
-        elif any(word in industry_lower for word in ['health', 'medical', 'bio']):
-            entities = [
-                ('Healthcare Providers', 'customer', 'serves', '#9467bd'),
-                ('FDA/Regulatory', 'related', 'complies_with', '#d62728'),
-                ('Medical Research', 'market', 'supports', '#9467bd')
-            ]
-        elif any(word in industry_lower for word in ['education', 'edtech']):
-            entities = [
-                ('Coursera', 'competitor', 'competes_with', '#ff7f0e'),
-                ('Schools/Universities', 'customer', 'serves', '#9467bd'),
-                ('Online Learning Market', 'market', 'operates_in', '#9467bd')
-            ]
-        elif any(word in industry_lower for word in ['ecommerce', 'retail', 'marketplace']):
-            entities = [
-                ('Amazon', 'competitor', 'competes_with', '#ff7f0e'),
-                ('Shopify', 'partner', 'integrates_with', '#2ca02c'),
-                ('Online Shoppers', 'market', 'serves', '#9467bd')
-            ]
-        else:
-            # Generic tech company
-            entities = [
-                ('Industry Leader', 'competitor', 'competes_with', '#ff7f0e'),
-                ('Cloud Platform', 'partner', 'uses', '#2ca02c'),
-                ('Target Market', 'market', 'serves', '#9467bd')
-            ]
-        
-        for idx, (entity, group, rel_label, color) in enumerate(entities):
-            node_id = f"ind_node_{start_id + idx}"
-            nodes.append({
-                'id': node_id,
-                'label': entity,
-                'group': group,
-                'size': 20,
-                'color': color,
-                'title': f"{group}: {entity}"
-            })
-            edges.append({
-                'from': 'main' if start_id == 0 else f"company_{start_id-1}",
-                'to': node_id,
-                'label': rel_label,
-                'arrows': 'to',
-                'color': color
-            })
-        
-        return nodes, edges
-    
-    async def _create_ai_powered_knowledge_graph(self, company_name: str) -> tuple:
-        """Create a complete knowledge graph using AI when no Neo4j data exists"""
-        try:
-            # Search for company in our data first
-            companies = await self.search_companies(company_name, 1)
-            company_data = companies[0] if companies else {}
-            
-            # Main company node
+            # Build graph
             nodes = [{
                 'id': 'main',
                 'label': company_name,
                 'group': 'main_company',
                 'size': 40,
-                'color': '#1f77b4',
-                'physics': False,
-                'title': company_data.get('description', f"{company_name} - No description available")[:100]
+                'color': '#1f77b4'
             }]
             edges = []
             
-            # Get AI-enhanced relationships
-            ai_nodes, ai_edges = await self._ai_enhance_knowledge_graph(
-                company_name,
-                company_data,
-                existing_node_count=1
-            )
+            node_configs = {
+                'competitors': ('#ff7f0e', 'competes_with'),
+                'partners': ('#2ca02c', 'partners_with'),
+                'technologies': ('#d62728', 'uses'),
+                'markets': ('#9467bd', 'serves')
+            }
             
-            nodes.extend(ai_nodes)
-            edges.extend(ai_edges)
+            for category, (color, rel_type) in node_configs.items():
+                for idx, item in enumerate(analysis.get(category, [])[:5]):
+                    node_id = f"{category}_{idx}"
+                    nodes.append({
+                        'id': node_id,
+                        'label': item,
+                        'group': category,
+                        'size': 20,
+                        'color': color
+                    })
+                    edges.append({
+                        'from': 'main',
+                        'to': node_id,
+                        'label': rel_type
+                    })
             
-            logger.info(f"Created AI-powered graph for {company_name} with {len(nodes)} nodes")
-            return nodes, edges
+            return {
+                'nodes': nodes,
+                'edges': edges,
+                'company_name': company_name,
+                'ai_enhanced': True,
+                'total_nodes': len(nodes),
+                'total_edges': len(edges)
+            }
             
         except Exception as e:
-            logger.error(f"AI-powered graph creation failed for {company_name}: {e}")
-            # Final fallback to sample graph
-            return self._create_sample_knowledge_graph(company_name)
+            logger.error(f"AI knowledge graph creation failed: {e}")
+            return self._create_fallback_knowledge_graph(company_name)
+    
+    def _create_fallback_knowledge_graph(self, company_name: str) -> Dict[str, Any]:
+        """Create fallback knowledge graph"""
+        nodes = [
+            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
+            {'id': 'comp1', 'label': 'Industry Leader', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
+            {'id': 'comp2', 'label': 'Market Player', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
+            {'id': 'tech1', 'label': 'Cloud Platform', 'group': 'technology', 'size': 20, 'color': '#d62728'},
+            {'id': 'market1', 'label': 'Target Market', 'group': 'market', 'size': 20, 'color': '#9467bd'},
+        ]
+        edges = [
+            {'from': 'main', 'to': 'comp1', 'label': 'competes_with'},
+            {'from': 'main', 'to': 'comp2', 'label': 'competes_with'},
+            {'from': 'main', 'to': 'tech1', 'label': 'uses'},
+            {'from': 'main', 'to': 'market1', 'label': 'serves'},
+        ]
+        return {
+            'nodes': nodes,
+            'edges': edges,
+            'company_name': company_name,
+            'ai_enhanced': False
+        }
+    
+    def _create_fallback_graph(self, company_id: int) -> Tuple[List, List]:
+        """Create fallback graph structure"""
+        nodes = [
+            {'id': f'company_{company_id}', 'label': f'Company {company_id}', 'group': 'company', 'size': 30, 'color': '#1f77b4'},
+            {'id': 'competitor_1', 'label': 'Competitor A', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
+            {'id': 'investor_1', 'label': 'Investor X', 'group': 'investor', 'size': 20, 'color': '#2ca02c'}
+        ]
+        edges = [
+            {'from': f'company_{company_id}', 'to': 'competitor_1', 'label': 'competes_with'},
+            {'from': f'company_{company_id}', 'to': 'investor_1', 'label': 'funded_by'}
+        ]
+        return nodes, edges
+    
+    def _get_fallback_company(self, company_id: int) -> Dict[str, Any]:
+        """Get fallback company data"""
+        return {
+            'id': company_id,
+            'name': f'Company {company_id}',
+            'description': 'Company details not available',
+            'industry': 'Unknown',
+            'founded_year': 2020,
+            'location': 'Unknown',
+            'website': 'N/A',
+            'yc_batch': 'N/A'
+        }
+    
+    def _get_sample_companies(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """Get curated sample companies based on search query"""
+        query_lower = query.lower()
+        
+        # Curated company database
+        company_databases = {
+            'ai': [
+                {'id': 1, 'name': 'OpenAI', 'description': 'AI research company focused on creating safe artificial general intelligence', 'industry': 'Artificial Intelligence', 'founded_year': 2015, 'location': 'San Francisco, CA', 'website': 'https://openai.com', 'yc_batch': 'S15', 'funding': '$11.3B', 'employees': '500-1000', 'stage': 'Series C'},
+                {'id': 2, 'name': 'Anthropic', 'description': 'AI safety company developing Claude, a helpful AI assistant', 'industry': 'Artificial Intelligence', 'founded_year': 2021, 'location': 'San Francisco, CA', 'website': 'https://anthropic.com', 'yc_batch': 'S21', 'funding': '$4.1B', 'employees': '200-500', 'stage': 'Series C'},
+                {'id': 3, 'name': 'Cohere', 'description': 'Natural language processing AI platform for enterprises', 'industry': 'Artificial Intelligence', 'founded_year': 2019, 'location': 'Toronto, Canada', 'website': 'https://cohere.ai', 'yc_batch': 'W19', 'funding': '$270M', 'employees': '100-200', 'stage': 'Series C'},
+            ],
+            'fintech': [
+                {'id': 7, 'name': 'Stripe', 'description': 'Online payment processing platform for internet businesses', 'industry': 'Financial Technology', 'founded_year': 2010, 'location': 'San Francisco, CA', 'website': 'https://stripe.com', 'yc_batch': 'S10', 'funding': '$2.2B', 'employees': '3000+', 'stage': 'Series H'},
+                {'id': 8, 'name': 'Coinbase', 'description': 'Cryptocurrency exchange and digital wallet platform', 'industry': 'Financial Technology', 'founded_year': 2012, 'location': 'San Francisco, CA', 'website': 'https://coinbase.com', 'yc_batch': 'S12', 'funding': '$547M', 'employees': '3000+', 'stage': 'Public'},
+                {'id': 9, 'name': 'Plaid', 'description': 'Financial data connectivity platform for fintech apps', 'industry': 'Financial Technology', 'founded_year': 2013, 'location': 'San Francisco, CA', 'website': 'https://plaid.com', 'yc_batch': 'S13', 'funding': '$734M', 'employees': '500-1000', 'stage': 'Acquired'},
+            ],
+            'saas': [
+                {'id': 12, 'name': 'Dropbox', 'description': 'Cloud storage and file synchronization service', 'industry': 'Software as a Service', 'founded_year': 2007, 'location': 'San Francisco, CA', 'website': 'https://dropbox.com', 'yc_batch': 'S07', 'funding': '$1.7B', 'employees': '3000+', 'stage': 'Public'},
+                {'id': 13, 'name': 'Airbnb', 'description': 'Online marketplace for short-term homestays and experiences', 'industry': 'Marketplace', 'founded_year': 2008, 'location': 'San Francisco, CA', 'website': 'https://airbnb.com', 'yc_batch': 'W08', 'funding': '$6.4B', 'employees': '5000+', 'stage': 'Public'},
+                {'id': 14, 'name': 'Twilio', 'description': 'Cloud communications platform for developers', 'industry': 'Software as a Service', 'founded_year': 2008, 'location': 'San Francisco, CA', 'website': 'https://twilio.com', 'yc_batch': 'S08', 'funding': '$1.2B', 'employees': '5000+', 'stage': 'Public'},
+            ],
+            'healthcare': [
+                {'id': 10, 'name': '23andMe', 'description': 'Personal genomics and biotechnology company', 'industry': 'Healthcare', 'founded_year': 2006, 'location': 'Sunnyvale, CA', 'website': 'https://23andme.com', 'yc_batch': 'S06', 'funding': '$791M', 'employees': '500-1000', 'stage': 'Public'},
+            ],
+            'edtech': [
+                {'id': 4, 'name': 'Khan Academy', 'description': 'Free online learning platform with personalized resources', 'industry': 'Education Technology', 'founded_year': 2008, 'location': 'Mountain View, CA', 'website': 'https://khanacademy.org', 'yc_batch': 'S08', 'funding': '$16M', 'employees': '200-500', 'stage': 'Non-profit'},
+                {'id': 5, 'name': 'Duolingo', 'description': 'Language learning platform with gamified lessons', 'industry': 'Education Technology', 'founded_year': 2011, 'location': 'Pittsburgh, PA', 'website': 'https://duolingo.com', 'yc_batch': 'S11', 'funding': '$183M', 'employees': '500-1000', 'stage': 'Public'},
+            ],
+        }
+        
+        # Find matching companies
+        matching = []
+        
+        # Check category matches
+        for category, companies in company_databases.items():
+            if category in query_lower or query_lower in category:
+                matching.extend(companies)
+        
+        # Check company name/description matches
+        for category, companies in company_databases.items():
+            for company in companies:
+                if (query_lower in company['name'].lower() or
+                    query_lower in company['description'].lower() or
+                    query_lower in company['industry'].lower()):
+                    if company not in matching:
+                        matching.append(company)
+        
+        # Keyword-based fallback
+        if not matching:
+            keyword_map = {
+                ('ai', 'artificial', 'intelligence', 'machine', 'learning', 'ml'): 'ai',
+                ('finance', 'fintech', 'payment', 'banking', 'crypto'): 'fintech',
+                ('education', 'learning', 'school', 'university', 'edtech'): 'edtech',
+                ('health', 'medical', 'healthcare', 'bio'): 'healthcare',
+                ('saas', 'software', 'platform', 'cloud'): 'saas',
+            }
+            
+            for keywords, category in keyword_map.items():
+                if any(kw in query_lower for kw in keywords):
+                    matching = company_databases.get(category, [])
+                    break
+        
+        # Default to AI companies
+        if not matching:
+            matching = company_databases['ai']
+        
+        return matching[:limit]

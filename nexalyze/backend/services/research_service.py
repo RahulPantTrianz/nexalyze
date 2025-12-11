@@ -1,23 +1,94 @@
+"""
+Enhanced Research Service with Advanced SERP API Integration
+Provides comprehensive company analysis using multiple data sources
+"""
+
 import aiohttp
 import asyncio
 from typing import Dict, Any, List
 import logging
 import random
+import ssl
 from datetime import datetime, timedelta
 from config.settings import settings
+from services.gemini_service import get_gemini_service
 import hashlib
 import re
+import json
 
 logger = logging.getLogger(__name__)
 
+
 class ResearchService:
+    """
+    Enhanced Research Service combining:
+    - Advanced SERP API features (Knowledge Graph, News, Related Searches)
+    - Gemini AI for intelligent analysis
+    - Multiple data source aggregation
+    - Caching for performance
+    """
+    
     def __init__(self):
         self.serp_api_key = settings.serp_api_key
+        self.gemini_service = None
+        self.cache: Dict[str, Dict] = {}
+        self.cache_ttl = 1800  # 30 minutes
+        
+        try:
+            self.gemini_service = get_gemini_service()
+        except Exception as e:
+            logger.warning(f"Could not initialize Gemini service: {e}")
+    
+    def _get_cache_key(self, prefix: str, query: str) -> str:
+        """Generate cache key"""
+        return hashlib.md5(f"{prefix}:{query}".encode()).hexdigest()
+    
+    def _get_from_cache(self, prefix: str, query: str) -> Any:
+        """Get from cache if not expired"""
+        key = self._get_cache_key(prefix, query)
+        if key in self.cache:
+            data = self.cache[key]
+            if datetime.now().timestamp() - data.get('timestamp', 0) < self.cache_ttl:
+                return data.get('value')
+        return None
+    
+    def _set_cache(self, prefix: str, query: str, value: Any):
+        """Set cache value"""
+        key = self._get_cache_key(prefix, query)
+        self.cache[key] = {'value': value, 'timestamp': datetime.now().timestamp()}
+    
+    async def _search(self, params: Dict[str, str]) -> Dict[str, Any]:
+        """Helper method to query SERP API with retry logic"""
+        url = "https://serpapi.com/search"
+        
+        for attempt in range(3):
+            try:
+                ssl_context = ssl.create_default_context()
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+                
+                connector = aiohttp.TCPConnector(ssl=ssl_context)
+                async with aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=30)) as session:
+                    async with session.get(url, params=params) as response:
+                        if response.status == 200:
+                            return await response.json()
+                        elif response.status == 429:
+                            # Rate limited, wait and retry
+                            await asyncio.sleep(2 ** attempt)
+                            continue
+                        else:
+                            logger.warning(f"SERP API returned status {response.status}")
+                            return {}
+            except Exception as e:
+                logger.warning(f"SERP API attempt {attempt + 1} failed: {str(e)[:100]}")
+                if attempt < 2:
+                    await asyncio.sleep(1)
+        
+        return {}
     
     async def analyze_company(self, company_name: str, include_competitors: bool = True, data_service=None) -> Dict[str, Any]:
-        """Analyze a company and its competitive landscape"""
+        """Comprehensive company analysis using multiple sources"""
         try:
-            # Validate company_name
             if not company_name or not isinstance(company_name, str):
                 return {'error': 'Invalid company name', 'company': company_name or 'N/A'}
             
@@ -25,21 +96,54 @@ class ResearchService:
             if not company_name:
                 return {'error': 'Company name cannot be empty', 'company': 'N/A'}
             
-            # Get company data from database first
+            # Check cache
+            cached = self._get_from_cache("analysis", company_name)
+            if cached:
+                logger.info(f"Returning cached analysis for {company_name}")
+                return cached
+            
+            # Get company data from database
             company_data = await self._get_company_data(company_name, data_service)
+            
+            # Parallel data fetching
+            tasks = [
+                self._get_company_overview(company_name, company_data),
+                self._analyze_market_position(company_name, company_data),
+                self._get_recent_news(company_name),
+                self._get_serp_comprehensive(company_name),
+            ]
+            
+            if include_competitors:
+                tasks.append(self._find_competitors(company_name, company_data))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
             
             analysis = {
                 'company': company_name,
-                'overview': await self._get_company_overview(company_name, company_data),
-                'market_position': await self._analyze_market_position(company_name, company_data),
-                'recent_news': await self._get_recent_news(company_name),
+                'overview': results[0] if not isinstance(results[0], Exception) else {},
+                'market_position': results[1] if not isinstance(results[1], Exception) else {},
+                'recent_news': results[2] if not isinstance(results[2], Exception) else [],
+                'serp_data': results[3] if not isinstance(results[3], Exception) else {},
             }
             
             if include_competitors:
-                analysis['competitors'] = await self._find_competitors(company_name, company_data)
-                analysis['competitive_analysis'] = await self._compare_with_competitors(
-                    company_name, analysis['competitors'], company_data
-                )
+                competitors = results[4] if not isinstance(results[4], Exception) else []
+                analysis['competitors'] = competitors
+                
+                # Get competitive analysis
+                comp_analysis = await self._compare_with_competitors(company_name, competitors, company_data)
+                analysis['competitive_analysis'] = comp_analysis
+            
+            # AI-enhanced insights if Gemini available
+            if self.gemini_service:
+                try:
+                    ai_insights = await self._get_ai_insights(company_name, analysis)
+                    analysis['ai_insights'] = ai_insights
+                except Exception as e:
+                    logger.warning(f"AI insights failed: {e}")
+            
+            # Cache results
+            self._set_cache("analysis", company_name, analysis)
             
             return analysis
             
@@ -59,536 +163,466 @@ class ResearchService:
             logger.warning(f"Could not fetch company data for {company_name}: {e}")
             return {}
     
-    async def _search(self, params: Dict[str, str]) -> Dict[str, Any]:
-        """Helper method to query SERP API"""
-        url = "https://serpapi.com/search"
-        try:
-            # Create SSL context that doesn't verify certificates (for corporate proxies)
-            import ssl
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            
-            connector = aiohttp.TCPConnector(ssl=ssl_context)
-            async with aiohttp.ClientSession(connector=connector) as session:
-                async with session.get(url, params=params) as response:
-                    if response.status == 200:
-                        return await response.json()
-                    else:
-                        logger.warning(f"SERP API returned status {response.status}, using fallback data")
-                        return {}
-        except Exception as e:
-            logger.warning(f"SERP API not available ({str(e)[:100]}), using fallback data")
+    async def _get_serp_comprehensive(self, company_name: str) -> Dict[str, Any]:
+        """Get comprehensive SERP data for company"""
+        if not self.serp_api_key:
             return {}
+        
+        result = {
+            'knowledge_graph': {},
+            'related_searches': [],
+            'people_also_ask': [],
+            'funding_info': {},
+            'social_profiles': []
+        }
+        
+        try:
+            # Basic company search
+            basic_params = {"q": company_name, "api_key": self.serp_api_key}
+            basic_data = await self._search(basic_params)
+            
+            if basic_data:
+                result['knowledge_graph'] = basic_data.get('knowledge_graph', {})
+                result['related_searches'] = basic_data.get('related_searches', [])
+                result['people_also_ask'] = basic_data.get('people_also_ask', [])
+                
+                # Extract social profiles from knowledge graph
+                kg = result['knowledge_graph']
+                if kg:
+                    for key in ['twitter', 'linkedin', 'facebook', 'instagram']:
+                        if key in kg:
+                            result['social_profiles'].append({
+                                'platform': key,
+                                'url': kg[key]
+                            })
+            
+            # Funding search
+            funding_params = {"q": f"{company_name} funding valuation", "api_key": self.serp_api_key}
+            funding_data = await self._search(funding_params)
+            
+            if funding_data:
+                answer_box = funding_data.get('answer_box', {})
+                if answer_box:
+                    result['funding_info'] = answer_box
+                else:
+                    # Extract funding from organic results
+                    for organic in funding_data.get('organic_results', [])[:3]:
+                        snippet = organic.get('snippet', '')
+                        funding_match = re.search(r'\$[\d.]+[BMK]?(?:\s*(?:million|billion))?', snippet, re.I)
+                        if funding_match:
+                            result['funding_info']['estimated'] = funding_match.group(0)
+                            break
+            
+            return result
+            
+        except Exception as e:
+            logger.warning(f"SERP comprehensive search failed: {e}")
+            return result
     
     async def _get_company_overview(self, company_name: str, company_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Get basic company information"""
-        # Fix NoneType errors by ensuring we have strings
+        """Get company overview combining database and SERP data"""
         if not company_name:
             company_name = "Unknown Company"
         
-        company_db_name = company_data.get('name') if company_data else None
-        if company_data and company_db_name and isinstance(company_db_name, str) and isinstance(company_name, str) and company_db_name.lower() == company_name.lower():
-            # Use actual company data from database
-            return {
+        # Start with database data
+        if company_data and company_data.get('name', '').lower() == company_name.lower():
+            overview = {
                 'name': company_data.get('name', company_name),
-                'description': company_data.get('description') or f"{company_name} is an innovative company in the technology sector",
+                'description': company_data.get('description') or f"{company_name} is an innovative company",
                 'industry': company_data.get('industry') or 'Technology',
-                'founded': str(company_data.get('founded_year', '2020')),
-                'employees': company_data.get('employees') or '50-100',
-                'funding': company_data.get('funding') or '$5M Series A',
+                'founded': str(company_data.get('founded_year', 'Unknown')),
+                'employees': company_data.get('employees') or 'Unknown',
+                'funding': company_data.get('funding') or 'Unknown',
                 'location': company_data.get('location') or 'Unknown',
                 'website': company_data.get('website') or 'N/A',
-                'stage': company_data.get('stage') or 'Early Stage'
+                'stage': company_data.get('stage') or 'Unknown'
             }
         else:
-            # Fetch from SERP API
+            overview = await self._generate_company_overview_from_serp(company_name)
+        
+        # Enrich with AI if available
+        if self.gemini_service and overview.get('description') == f"{company_name} is an innovative company":
+            try:
+                ai_desc = await self._get_ai_company_description(company_name)
+                if ai_desc:
+                    overview['description'] = ai_desc
+            except Exception as e:
+                logger.debug(f"AI description failed: {e}")
+        
+        return overview
+    
+    async def _generate_company_overview_from_serp(self, company_name: str) -> Dict[str, Any]:
+        """Generate company overview from SERP API"""
+        if self.serp_api_key:
             params = {"q": company_name, "api_key": self.serp_api_key}
             data = await self._search(params)
             kg = data.get('knowledge_graph', {})
+            
             if kg:
-                funding = kg.get('total_funding_amount')
-                if not funding:
+                funding = kg.get('total_funding_amount', 'Unknown')
+                if funding == 'Unknown':
                     funding_params = {"q": f"{company_name} total funding", "api_key": self.serp_api_key}
                     funding_data = await self._search(funding_params)
                     funding_kg = funding_data.get('knowledge_graph', {})
                     funding_ab = funding_data.get('answer_box', {})
                     funding = funding_kg.get('total_funding_amount') or funding_ab.get('answer') or 'Unknown'
-                # Fix NoneType by ensuring we have strings
+                
                 kg_type = kg.get('type') or ''
                 kg_desc = kg.get('description') or ''
                 stage = 'Public' if 'public' in (kg_type + kg_desc).lower() else 'Private'
+                
                 return {
                     'name': kg.get('title', company_name),
                     'description': kg.get('description') or f"{company_name} is an innovative company.",
                     'industry': kg.get('industry') or 'Technology',
                     'founded': kg.get('founded') or 'Unknown',
                     'employees': kg.get('number_of_employees') or 'Unknown',
-                    'funding': funding or 'Unknown',
+                    'funding': funding,
                     'location': kg.get('headquarters') or 'Unknown',
                     'website': kg.get('website') or 'N/A',
                     'stage': stage
                 }
-            else:
-                # Fallback to generated data if no knowledge graph
-                return await self._generate_realistic_company_data(company_name)
+        
+        # Fallback to well-known companies or generated data
+        return await self._generate_realistic_company_data(company_name)
+    
+    async def _get_ai_company_description(self, company_name: str) -> str:
+        """Get AI-generated company description"""
+        if not self.gemini_service:
+            return None
+        
+        prompt = f"""Write a concise 2-3 sentence professional description for the company "{company_name}".
+Focus on what the company does, its main products/services, and value proposition.
+Return only the description, no other text."""
+
+        return await self.gemini_service.generate_content(prompt, temperature=0.3)
+    
+    async def _get_ai_insights(self, company_name: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
+        """Get AI-powered insights based on collected data"""
+        if not self.gemini_service:
+            return {}
+        
+        try:
+            overview = analysis.get('overview', {})
+            competitors = analysis.get('competitors', [])
+            news = analysis.get('recent_news', [])
+            
+            prompt = f"""Analyze this company data and provide strategic insights:
+
+Company: {company_name}
+Industry: {overview.get('industry', 'Unknown')}
+Description: {overview.get('description', 'N/A')}
+Stage: {overview.get('stage', 'Unknown')}
+Competitors: {', '.join(competitors[:5]) if competitors else 'Unknown'}
+Recent News Count: {len(news)}
+
+Provide:
+1. Key market opportunity (1-2 sentences)
+2. Main competitive advantage (1-2 sentences)
+3. Primary growth strategy recommendation (1-2 sentences)
+4. Key risk factor (1 sentence)
+
+Return as JSON:
+{{
+    "market_opportunity": "...",
+    "competitive_advantage": "...",
+    "growth_strategy": "...",
+    "key_risk": "..."
+}}"""
+
+            response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+            
+            json_match = re.search(r'\{[\s\S]*\}', response)
+            if json_match:
+                return json.loads(json_match.group())
+            
+            return {}
+            
+        except Exception as e:
+            logger.warning(f"AI insights generation failed: {e}")
+            return {}
     
     async def _generate_realistic_company_data(self, company_name: str) -> Dict[str, Any]:
-        """Generate realistic company data based on company name (fallback)"""
+        """Generate realistic company data (fallback)"""
         if not company_name or not isinstance(company_name, str):
             company_name = "Unknown Company"
         
         company_lower = company_name.lower()
         
-        # Well-known companies with realistic data
+        # Well-known companies database
         known_companies = {
-            'tesla': {
-                'name': 'Tesla',
-                'description': 'Electric vehicle and clean energy company revolutionizing transportation and energy storage',
-                'industry': 'Automotive',
-                'founded': '2003',
-                'employees': '100,000+',
-                'funding': '$6.5B',
-                'location': 'Austin, TX',
-                'website': 'https://tesla.com',
-                'stage': 'Public'
-            },
-            'spotify': {
-                'name': 'Spotify',
-                'description': 'Music streaming platform providing access to millions of songs and podcasts worldwide',
-                'industry': 'Entertainment',
-                'founded': '2006',
-                'employees': '8,000+',
-                'funding': '$2.6B',
-                'location': 'Stockholm, Sweden',
-                'website': 'https://spotify.com',
-                'stage': 'Public'
-            },
-            'stripe': {
-                'name': 'Stripe',
-                'description': 'Online payment processing platform enabling businesses to accept payments over the internet',
-                'industry': 'Financial Technology',
-                'founded': '2010',
-                'employees': '7,000+',
-                'funding': '$2.2B',
-                'location': 'San Francisco, CA',
-                'website': 'https://stripe.com',
-                'stage': 'Private'
-            },
-            'openai': {
-                'name': 'OpenAI',
-                'description': 'AI research company focused on creating safe artificial general intelligence',
-                'industry': 'Artificial Intelligence',
-                'founded': '2015',
-                'employees': '500-1000',
-                'funding': '$11.3B',
-                'location': 'San Francisco, CA',
-                'website': 'https://openai.com',
-                'stage': 'Series C'
-            },
-            'zoom': {
-                'name': 'Zoom',
-                'description': 'Video communications platform providing video conferencing and collaboration tools',
-                'industry': 'Software as a Service',
-                'founded': '2011',
-                'employees': '8,000+',
-                'funding': '$1.1B',
-                'location': 'San Jose, CA',
-                'website': 'https://zoom.us',
-                'stage': 'Public'
-            },
-            'databricks': {
-                'name': 'Databricks',
-                'description': 'Unified analytics platform for big data and machine learning, built on Apache Spark',
-                'industry': 'Data Analytics',
-                'founded': '2013',
-                'employees': '6,000+',
-                'funding': '$3.5B',
-                'location': 'San Francisco, CA',
-                'website': 'https://databricks.com',
-                'stage': 'Series H'
-            },
-            'byjus': {
-                'name': "Byju's",
-                'description': 'Global ed-tech company providing adaptive and effective learning solutions to millions of students',
-                'industry': 'Education Technology',
-                'founded': '2011',
-                'employees': '27,000+',
-                'funding': '$4.45B',
-                'location': 'Bengaluru, India',
-                'website': 'https://byjus.com',
-                'stage': 'Series F'
-            }
+            'tesla': {'name': 'Tesla', 'description': 'Electric vehicle and clean energy company', 'industry': 'Automotive/Energy', 'founded': '2003', 'employees': '100,000+', 'funding': '$6.5B', 'location': 'Austin, TX', 'website': 'https://tesla.com', 'stage': 'Public'},
+            'spotify': {'name': 'Spotify', 'description': 'Music streaming platform', 'industry': 'Entertainment', 'founded': '2006', 'employees': '8,000+', 'funding': '$2.6B', 'location': 'Stockholm, Sweden', 'website': 'https://spotify.com', 'stage': 'Public'},
+            'stripe': {'name': 'Stripe', 'description': 'Online payment processing platform', 'industry': 'FinTech', 'founded': '2010', 'employees': '7,000+', 'funding': '$2.2B', 'location': 'San Francisco, CA', 'website': 'https://stripe.com', 'stage': 'Private'},
+            'openai': {'name': 'OpenAI', 'description': 'AI research company developing safe AGI', 'industry': 'Artificial Intelligence', 'founded': '2015', 'employees': '1,000+', 'funding': '$11.3B', 'location': 'San Francisco, CA', 'website': 'https://openai.com', 'stage': 'Series C'},
+            'anthropic': {'name': 'Anthropic', 'description': 'AI safety company developing Claude', 'industry': 'Artificial Intelligence', 'founded': '2021', 'employees': '500+', 'funding': '$4.1B', 'location': 'San Francisco, CA', 'website': 'https://anthropic.com', 'stage': 'Series C'},
+            'databricks': {'name': 'Databricks', 'description': 'Unified analytics platform for big data and ML', 'industry': 'Data Analytics', 'founded': '2013', 'employees': '6,000+', 'funding': '$3.5B', 'location': 'San Francisco, CA', 'website': 'https://databricks.com', 'stage': 'Series H'},
+            'notion': {'name': 'Notion', 'description': 'All-in-one workspace for notes and collaboration', 'industry': 'SaaS/Productivity', 'founded': '2016', 'employees': '500+', 'funding': '$343M', 'location': 'San Francisco, CA', 'website': 'https://notion.so', 'stage': 'Series C'},
+            'figma': {'name': 'Figma', 'description': 'Collaborative interface design tool', 'industry': 'Design Software', 'founded': '2012', 'employees': '800+', 'funding': '$333M', 'location': 'San Francisco, CA', 'website': 'https://figma.com', 'stage': 'Acquired'},
+            'discord': {'name': 'Discord', 'description': 'Voice, video, and text communication platform', 'industry': 'Communication', 'founded': '2015', 'employees': '600+', 'funding': '$983M', 'location': 'San Francisco, CA', 'website': 'https://discord.com', 'stage': 'Series H'},
+            'coinbase': {'name': 'Coinbase', 'description': 'Cryptocurrency exchange platform', 'industry': 'FinTech/Crypto', 'founded': '2012', 'employees': '3,000+', 'funding': '$547M', 'location': 'San Francisco, CA', 'website': 'https://coinbase.com', 'stage': 'Public'},
         }
         
-        # Check if it's a known company
         for key, data in known_companies.items():
             if key in company_lower:
                 return data
         
-        # Generate generic realistic data for unknown companies
-        industries = ['Technology', 'Software', 'Healthcare', 'Finance', 'E-commerce', 'Education']
+        # Generate for unknown companies
+        industries = ['Technology', 'Software', 'Healthcare', 'Finance', 'E-commerce', 'Education', 'AI/ML']
         stages = ['Seed', 'Series A', 'Series B', 'Series C', 'Private', 'Public']
-        locations = ['San Francisco, CA', 'New York, NY', 'Austin, TX', 'Seattle, WA', 'Boston, MA']
+        locations = ['San Francisco, CA', 'New York, NY', 'Austin, TX', 'Seattle, WA', 'Boston, MA', 'Los Angeles, CA']
         
-        # Use hash of company name for consistent results
         hash_value = int(hashlib.md5(company_name.encode()).hexdigest(), 16)
-        
-        # Generate website URL safely
-        safe_url_name = company_name.lower().replace(" ", "").replace(".", "") if company_name else "company"
+        safe_url = company_name.lower().replace(" ", "").replace(".", "")
         
         return {
             'name': company_name,
-            'description': f"{company_name} is an innovative company focused on delivering cutting-edge solutions in the technology sector",
+            'description': f"{company_name} is an innovative company delivering cutting-edge solutions",
             'industry': industries[hash_value % len(industries)],
-            'founded': str(2010 + (hash_value % 11)),  # 2010-2020
-            'employees': f"{10 + (hash_value % 990)}+",  # 10-1000+
-            'funding': f"${1 + (hash_value % 99)}M",  # $1M-$100M
+            'founded': str(2010 + (hash_value % 12)),
+            'employees': f"{10 + (hash_value % 990)}+",
+            'funding': f"${1 + (hash_value % 99)}M",
             'location': locations[hash_value % len(locations)],
-            'website': f'https://{safe_url_name}.com',
+            'website': f'https://{safe_url}.com',
             'stage': stages[hash_value % len(stages)]
         }
     
     async def _analyze_market_position(self, company_name: str, company_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Analyze company's market position"""
-        # Get industry from company data or overview
-        industry = company_data.get('industry') if company_data else (await self._get_company_overview(company_name, {})).get('industry', 'Technology')
-        stage = company_data.get('stage') if company_data else (await self._get_company_overview(company_name, {})).get('stage', 'Early Stage')
+        """Analyze company's market position using SERP API"""
+        industry = company_data.get('industry') if company_data else 'Technology'
+        stage = company_data.get('stage') if company_data else 'Unknown'
         
-        # Fetch real market data using SERP API
-        size_params = {"q": f"global {industry} market size 2025", "api_key": self.serp_api_key}
-        size_data = await self._search(size_params)
-        size_ab = size_data.get('answer_box', {})
-        snippet = size_ab.get('answer', '') or size_ab.get('snippet', '') or ''
-        if not snippet:
-            size_organic = size_data.get('organic_results', [])
-            if size_organic:
-                snippet = ' '.join([r.get('snippet', '') for r in size_organic[:3]])
-        match = re.search(r'\$?[\d.,]+ ?[Bb]illion|\$?[\d.,]+ ?[Tt]rillion|\$?[\d.,]+ ?[Mm]illion', snippet, re.IGNORECASE)
-        if match:
-            market_size = match.group(0).replace(',', '')
-        else:
-            market_size = 'Unknown'
-        
-        growth_params = {"q": f"{industry} market growth rate", "api_key": self.serp_api_key}
-        growth_data = await self._search(growth_params)
-        growth_ab = growth_data.get('answer_box', {})
-        snippet = growth_ab.get('answer', '') or growth_ab.get('snippet', '') or ''
-        if not snippet:
-            growth_organic = growth_data.get('organic_results', [])
-            if growth_organic:
-                snippet = ' '.join([r.get('snippet', '') for r in growth_organic[:3]])
-        match = re.search(r'[\d.]+ ?%', snippet)
-        if match:
-            growth_rate = match.group(0) + ' YoY'
-        else:
-            growth_rate = 'Unknown'
-        
-        share_params = {"q": f"{company_name} market share", "api_key": self.serp_api_key}
-        share_data = await self._search(share_params)
-        share_ab = share_data.get('answer_box', {})
-        snippet = share_ab.get('answer', '') or share_ab.get('snippet', '') or ''
-        if not snippet:
-            share_organic = share_data.get('organic_results', [])
-            if share_organic:
-                snippet = ' '.join([r.get('snippet', '') for r in share_organic[:3]])
-        match = re.search(r'[\d.]+ ?%', snippet)
-        if match:
-            market_share = match.group(0)
-        else:
-            market_share = 'Unknown'
-        
-        # Fallback to generated if no data
-        if market_size == 'Unknown':
-            market_data = {
-                'artificial intelligence': {'size': '$390B', 'growth': '29%', 'share': '3-8%'},
-                'financial technology': {'size': '$310B', 'growth': '20%', 'share': '2-6%'},
-                'healthcare': {'size': '$4.2T', 'growth': '12%', 'share': '1-4%'},
-                'software as a service': {'size': '$720B', 'growth': '18%', 'share': '2-7%'},
-                'education technology': {'size': '$187B', 'growth': '17%', 'share': '1-3%'},
-                'e-commerce': {'size': '$5.7T', 'growth': '14%', 'share': '2-5%'},
-                'automotive': {'size': '$2.7T', 'growth': '8%', 'share': '1-3%'},
-                'mobility': {'size': '$2.7T', 'growth': '8%', 'share': '1-3%'},
-                'energy': {'size': '$1.2T', 'growth': '10%', 'share': '2-5%'},
-                'entertainment': {'size': '$2.3T', 'growth': '12%', 'share': '1-4%'},
-                'music': {'size': '$2.3T', 'growth': '12%', 'share': '1-4%'},
-                'data analytics': {'size': '$274B', 'growth': '22%', 'share': '3-8%'},
-                'education': {'size': '$7T', 'growth': '5%', 'share': '1-3%'},
-                'technology': {'size': '$4.9T', 'growth': '5.6%', 'share': '2-5%'}
-            }
-            industry_lower = industry.lower() if industry and isinstance(industry, str) else 'technology'
-            market_info = market_data.get(industry_lower, {'size': '$1.2B', 'growth': '15%', 'share': '2-5%'})
-            for key in market_data:
-                if key in industry_lower or any(word in industry_lower for word in key.split()):
-                    market_info = market_data[key]
-                    break
-            market_size = market_info['size']
-            growth_rate = f"{market_info['growth']} YoY"
-            market_share = market_info['share']
-        
-        positioning_options = [
-            f"{company_name} is positioned as a {stage} player with strong growth potential in the {industry} market",
-            f"A {stage} company focusing on innovation and market expansion in {industry}",
-            f"Emerging {stage} player with competitive advantages in the {industry} sector",
-            f"Growing {stage} company with significant market opportunity in {industry}"
-        ]
-        hash_value = int(hashlib.md5(company_name.encode()).hexdigest(), 16)
-        positioning = positioning_options[hash_value % len(positioning_options)]
-        
-        return {
-            'market_size': market_size,
-            'growth_rate': growth_rate,
-            'market_share': market_share,
-            'positioning': positioning
+        result = {
+            'market_size': 'Unknown',
+            'growth_rate': 'Unknown',
+            'market_share': 'Unknown',
+            'positioning': f"{company_name} operates in the {industry} sector"
         }
+        
+        if self.serp_api_key:
+            # Market size search
+            size_params = {"q": f"global {industry} market size 2025", "api_key": self.serp_api_key}
+            size_data = await self._search(size_params)
+            
+            if size_data:
+                snippet = ''
+                ab = size_data.get('answer_box', {})
+                if ab:
+                    snippet = ab.get('answer', '') or ab.get('snippet', '')
+                if not snippet:
+                    for r in size_data.get('organic_results', [])[:3]:
+                        snippet += ' ' + r.get('snippet', '')
+                
+                match = re.search(r'\$?[\d.,]+\s*(?:billion|trillion|million|B|T|M)', snippet, re.I)
+                if match:
+                    result['market_size'] = match.group(0).strip()
+            
+            # Growth rate search
+            growth_params = {"q": f"{industry} market growth rate CAGR", "api_key": self.serp_api_key}
+            growth_data = await self._search(growth_params)
+            
+            if growth_data:
+                snippet = ''
+                ab = growth_data.get('answer_box', {})
+                if ab:
+                    snippet = ab.get('answer', '') or ab.get('snippet', '')
+                if not snippet:
+                    for r in growth_data.get('organic_results', [])[:3]:
+                        snippet += ' ' + r.get('snippet', '')
+                
+                match = re.search(r'[\d.]+\s*%', snippet)
+                if match:
+                    result['growth_rate'] = f"{match.group(0)} CAGR"
+        
+        # Fallback market data
+        if result['market_size'] == 'Unknown':
+            market_data = {
+                'artificial intelligence': {'size': '$390B', 'growth': '29%'},
+                'fintech': {'size': '$310B', 'growth': '20%'},
+                'healthcare': {'size': '$4.2T', 'growth': '12%'},
+                'saas': {'size': '$720B', 'growth': '18%'},
+                'education': {'size': '$7T', 'growth': '5%'},
+                'e-commerce': {'size': '$5.7T', 'growth': '14%'},
+                'technology': {'size': '$4.9T', 'growth': '5.6%'}
+            }
+            
+            industry_lower = (industry or 'technology').lower()
+            for key, data in market_data.items():
+                if key in industry_lower:
+                    result['market_size'] = data['size']
+                    result['growth_rate'] = f"{data['growth']} CAGR"
+                    break
+        
+        result['positioning'] = f"{company_name} is positioned as a {stage} player in the {industry} market with significant growth potential"
+        
+        return result
     
     async def _get_recent_news(self, company_name: str) -> List[Dict[str, Any]]:
-        """Get recent news about the company"""
-        params = {"engine": "google_news", "q": company_name, "api_key": self.serp_api_key}
-        data = await self._search(params)
-        news_results = data.get('news_results', [])
-        if news_results:
-            news_items = []
-            for n in news_results[:5]:
-                news_items.append({
-                    'title': n.get('title', ''),
-                    'url': n.get('link', ''),
-                    'date': n.get('date', ''),
-                    'source': n.get('source', ''),
-                    'summary': n.get('snippet', '')
-                })
-            return news_items
-        else:
-            # Fallback to generated news if API fails
-            news_templates = [
-                {
-                    'title': f'{company_name} Secures ${{amount}}M in {{round}} Funding',
-                    'summary': f'{company_name} has successfully raised funding to accelerate product development and market expansion.',
-                    'source': 'TechCrunch'
-                },
-                {
-                    'title': f'{company_name} Launches New {{product}} Platform',
-                    'summary': f'{company_name} unveils innovative platform designed to revolutionize the industry.',
-                    'source': 'VentureBeat'
-                },
-                {
-                    'title': f'{company_name} Partners with {{partner}} for Strategic Growth',
-                    'summary': f'{company_name} forms strategic partnership to expand market reach and capabilities.',
-                    'source': 'Reuters'
-                },
-                {
-                    'title': f'{company_name} Expands Team with Key {{role}} Hires',
-                    'summary': f'{company_name} strengthens leadership team with experienced industry professionals.',
-                    'source': 'Business Wire'
-                },
-                {
-                    'title': f'{company_name} Reports Strong {{metric}} Growth',
-                    'summary': f'{company_name} demonstrates strong performance metrics and user growth.',
-                    'source': 'Forbes'
-                }
-            ]
+        """Get recent news using SERP API news search"""
+        if self.serp_api_key:
+            params = {
+                "engine": "google_news",
+                "q": company_name,
+                "api_key": self.serp_api_key
+            }
+            data = await self._search(params)
             
-            hash_value = int(hashlib.md5(company_name.encode()).hexdigest(), 16)
-            num_news = 3 + (hash_value % 3)  # 3-5 news items
-            
-            selected_news = []
-            for i in range(num_news):
-                selected_news.append(news_templates[(hash_value + i) % len(news_templates)])
-            
-            news_items = []
-            for i, template in enumerate(selected_news):
-                days_ago = 1 + ((hash_value + i) % 30)
-                news_date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')
-                
-                title = template['title']
-                summary = template['summary']
-                
-                replacements = {
-                    '{amount}': str(5 + ((hash_value + i) % 45)),
-                    '{round}': ['Series A', 'Series B', 'Series C', 'Seed'][(hash_value + i) % 4],
-                    '{product}': ['AI-Powered', 'Cloud-Based', 'Mobile', 'Enterprise'][(hash_value + i) % 4],
-                    '{partner}': ['Microsoft', 'Google', 'Amazon', 'Salesforce', 'IBM'][(hash_value + i) % 5],
-                    '{role}': ['Executive', 'Engineering', 'Sales', 'Marketing'][(hash_value + i) % 4],
-                    '{metric}': ['Revenue', 'User', 'Customer', 'Market'][(hash_value + i) % 4]
-                }
-                
-                for placeholder, value in replacements.items():
-                    title = title.replace(placeholder, value)
-                    summary = summary.replace(placeholder, value)
-                
-                # Safety check for company_name
-                safe_company_name = company_name if company_name and isinstance(company_name, str) else 'company'
-                url_slug = safe_company_name.lower().replace(' ', '-').replace('.', '')
-                realistic_urls = [
-                    f'https://techcrunch.com/2024/10/{url_slug}-funding-announcement',
-                    f'https://venturebeat.com/2024/10/{url_slug}-platform-launch',
-                    f'https://reuters.com/technology/{url_slug}-partnership',
-                    f'https://businesswire.com/news/home/{url_slug}-expansion',
-                    f'https://forbes.com/sites/technology/{url_slug}-growth'
+            if data and data.get('news_results'):
+                return [
+                    {
+                        'title': n.get('title', ''),
+                        'url': n.get('link', ''),
+                        'date': n.get('date', ''),
+                        'source': n.get('source', ''),
+                        'summary': n.get('snippet', '')
+                    }
+                    for n in data['news_results'][:5]
                 ]
-                url = realistic_urls[i % len(realistic_urls)]
-                
-                news_items.append({
-                    'title': title,
-                    'url': url,
-                    'date': news_date,
-                    'source': template['source'],
-                    'summary': summary
-                })
+        
+        # Fallback generated news
+        return self._generate_fallback_news(company_name)
+    
+    def _generate_fallback_news(self, company_name: str) -> List[Dict[str, Any]]:
+        """Generate realistic fallback news"""
+        templates = [
+            {'title': f'{company_name} Expands Operations', 'source': 'TechCrunch'},
+            {'title': f'{company_name} Announces Strategic Partnership', 'source': 'VentureBeat'},
+            {'title': f'{company_name} Reports Strong Growth', 'source': 'Forbes'},
+        ]
+        
+        hash_value = int(hashlib.md5(company_name.encode()).hexdigest(), 16)
+        news = []
+        
+        for i, template in enumerate(templates):
+            days_ago = 1 + ((hash_value + i) % 14)
+            news_date = (datetime.now() - timedelta(days=days_ago)).strftime('%Y-%m-%d')
             
-            return news_items
+            news.append({
+                'title': template['title'],
+                'url': f"https://example.com/news/{i}",
+                'date': news_date,
+                'source': template['source'],
+                'summary': f"Latest developments from {company_name}..."
+            })
+        
+        return news
     
     async def _find_competitors(self, company_name: str, company_data: Dict[str, Any]) -> List[str]:
-        """Find competitors for the company"""
-        params = {"q": company_name, "api_key": self.serp_api_key}
-        data = await self._search(params)
-        kg = data.get('knowledge_graph', {})
-        also_search = kg.get('people_also_search_for', [])
-        competitors = [c.get('title', '') for c in also_search if c.get('title')] [:5]
-        
-        if not competitors:
-            # Alternative search for competitors
-            comp_params = {"q": f"{company_name} competitors", "api_key": self.serp_api_key}
+        """Find competitors using SERP API"""
+        if self.serp_api_key:
+            # Try knowledge graph first
+            params = {"q": company_name, "api_key": self.serp_api_key}
+            data = await self._search(params)
+            kg = data.get('knowledge_graph', {})
+            
+            competitors = []
+            
+            # From "people also search for"
+            for item in kg.get('people_also_search_for', [])[:5]:
+                if item.get('title'):
+                    competitors.append(item['title'])
+            
+            if competitors:
+                return competitors
+            
+            # Direct competitor search
+            comp_params = {"q": f"{company_name} competitors alternatives", "api_key": self.serp_api_key}
             comp_data = await self._search(comp_params)
-            organic = comp_data.get('organic_results', [])
-            if organic:
-                snippet = ' '.join([r.get('snippet', '') for r in organic[:3]])
-                # Extract potential competitor names (simple regex for company names)
-                potential = re.findall(r'\b[A-Z][a-z]+(?: [A-Z][a-z]+)?\b', snippet)
-                competitors = list(set(potential[:5]))  # Dedupe and take 5
-        if not competitors:
-            # Fallback to generated
-            industry = company_data.get('industry', '').lower() if company_data else (await self._get_company_overview(company_name, {})).get('industry', '').lower()
-            company_lower = company_name.lower()
-            if 'tesla' in company_lower:
-                return ["Toyota", "BMW", "Mercedes-Benz", "Ford", "General Motors"]
-            elif 'spotify' in company_lower:
-                return ["Apple Music", "Amazon Music", "YouTube Music", "Pandora"]
-            elif 'stripe' in company_lower:
-                return ["Square", "PayPal", "Adyen", "Razorpay"]
-            elif 'openai' in company_lower:
-                return ["Anthropic", "Cohere", "Scale AI", "Hugging Face"]
-            elif 'zoom' in company_lower:
-                return ["Microsoft Teams", "Google Meet", "Skype", "Webex"]
-            elif 'databricks' in company_lower:
-                return ["Snowflake", "AWS Redshift", "Google BigQuery", "Microsoft Azure Synapse"]
-            elif 'byjus' in company_lower:
-                return ["Unacademy", "Vedantu", "Coursera", "Khan Academy"]
             
-            competitor_db = {
-                'artificial intelligence': ["OpenAI", "Anthropic", "Cohere", "Scale AI", "Hugging Face", "Replicate"],
-                'financial technology': ["Stripe", "Square", "PayPal", "Adyen", "Razorpay", "Plaid"],
-                'healthcare': ["Teladoc", "Amwell", "Livongo", "Ro", "Hims & Hers", "GoodRx"],
-                'software as a service': ["Salesforce", "HubSpot", "Slack", "Zoom", "Notion", "Airtable"],
-                'education technology': ["Coursera", "Udemy", "Khan Academy", "Duolingo", "MasterClass", "Skillshare"],
-                'e-commerce': ["Shopify", "WooCommerce", "BigCommerce", "Magento", "Squarespace", "Wix"],
-                'gaming': ["Epic Games", "Unity", "Roblox", "Discord", "Twitch", "Steam"],
-                'mobility': ["Uber", "Lyft", "Tesla", "Waymo", "Bird", "Lime"],
-                'automotive': ["Toyota", "BMW", "Mercedes-Benz", "Ford", "General Motors", "Tesla"],
-                'real estate': ["Zillow", "Redfin", "Compass", "Opendoor", "Realtor.com", "Trulia"],
-                'entertainment': ["Netflix", "Disney+", "Amazon Prime", "HBO Max", "Apple TV+", "Spotify"],
-                'music': ["Apple Music", "Amazon Music", "YouTube Music", "Pandora", "SoundCloud", "Spotify"],
-                'data analytics': ["Snowflake", "AWS Redshift", "Google BigQuery", "Microsoft Azure Synapse", "Tableau", "Power BI"]
-            }
-            
-            for industry_key in competitor_db:
-                if industry_key in industry:
-                    return competitor_db[industry_key][:4]
-            
-            return [f"{company_name} Competitor {i+1}" for i in range(4)]
+            if comp_data:
+                for r in comp_data.get('organic_results', [])[:3]:
+                    snippet = r.get('snippet', '')
+                    # Extract company names (capitalized words)
+                    names = re.findall(r'\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b', snippet)
+                    for name in names:
+                        if name.lower() != company_name.lower() and len(name) > 2:
+                            competitors.append(name)
+                
+                if competitors:
+                    return list(set(competitors))[:5]
         
-        return competitors
+        # Fallback competitors by industry
+        return self._get_fallback_competitors(company_name, company_data)
+    
+    def _get_fallback_competitors(self, company_name: str, company_data: Dict[str, Any]) -> List[str]:
+        """Get fallback competitors based on industry"""
+        industry = (company_data.get('industry', '') if company_data else '').lower()
+        company_lower = company_name.lower()
+        
+        competitor_db = {
+            'ai': ["OpenAI", "Anthropic", "Cohere", "Scale AI", "Hugging Face"],
+            'fintech': ["Stripe", "Square", "PayPal", "Adyen", "Plaid"],
+            'healthcare': ["Teladoc", "Amwell", "Oscar Health", "Ro", "GoodRx"],
+            'saas': ["Salesforce", "HubSpot", "Notion", "Airtable", "Monday.com"],
+            'education': ["Coursera", "Udemy", "Khan Academy", "Duolingo", "Skillshare"],
+            'ecommerce': ["Shopify", "BigCommerce", "WooCommerce", "Magento", "Wix"],
+        }
+        
+        for key, competitors in competitor_db.items():
+            if key in industry or key in company_lower:
+                return [c for c in competitors if c.lower() != company_lower][:5]
+        
+        return ["Industry Leader A", "Competitor B", "Rival C", "Alternative D"]
     
     async def _compare_with_competitors(self, company_name: str, competitors: List[str], company_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Compare company with its competitors"""
-        # Attempt to fetch SWOT from search
-        swot_params = {"q": f"{company_name} swot analysis", "api_key": self.serp_api_key}
-        swot_data = await self._search(swot_params)
-        organic = swot_data.get('organic_results', [])
-        swot_dict = {'strengths': [], 'weaknesses': [], 'opportunities': [], 'threats': []}
-        if organic:
-            snippet = ' '.join([r.get('snippet', '') for r in organic[:3]])
-            # Simple extraction: look for sections
-            strengths_match = re.findall(r'Strengths?: (.*?)(?:Weaknesses|Opportunities|Threats|$)', snippet, re.IGNORECASE | re.DOTALL)
-            weaknesses_match = re.findall(r'Weaknesses?: (.*?)(?:Opportunities|Threats|Strengths|$)', snippet, re.IGNORECASE | re.DOTALL)
-            opportunities_match = re.findall(r'Opportunities?: (.*?)(?:Threats|Strengths|Weaknesses|$)', snippet, re.IGNORECASE | re.DOTALL)
-            threats_match = re.findall(r'Threats?: (.*?)(?:Strengths|Weaknesses|Opportunities|$)', snippet, re.IGNORECASE | re.DOTALL)
-            swot_dict['strengths'] = [s.strip() for s in ''.join(strengths_match).split(';') if s.strip()] if strengths_match else []
-            swot_dict['weaknesses'] = [w.strip() for w in ''.join(weaknesses_match).split(';') if w.strip()] if weaknesses_match else []
-            swot_dict['opportunities'] = [o.strip() for o in ''.join(opportunities_match).split(';') if o.strip()] if opportunities_match else []
-            swot_dict['threats'] = [t.strip() for t in ''.join(threats_match).split(';') if t.strip()] if threats_match else []
+        """Generate competitive comparison"""
+        industry = company_data.get('industry', 'Technology') if company_data else 'Technology'
+        stage = company_data.get('stage', 'Growth') if company_data else 'Growth'
         
-        industry = company_data.get('industry', 'Technology').lower() if company_data else (await self._get_company_overview(company_name, {})).get('industry', 'Technology').lower()
-        stage = company_data.get('stage', 'Early Stage') if company_data else (await self._get_company_overview(company_name, {})).get('stage', 'Early Stage')
+        # Use AI if available
+        if self.gemini_service:
+            try:
+                prompt = f"""Generate a SWOT analysis for {company_name} in the {industry} industry.
+Competitors: {', '.join(competitors[:3])}
+
+Return JSON:
+{{
+    "strengths": ["str1", "str2", "str3", "str4"],
+    "weaknesses": ["weak1", "weak2", "weak3", "weak4"],
+    "opportunities": ["opp1", "opp2", "opp3", "opp4"],
+    "threats": ["threat1", "threat2", "threat3", "threat4"],
+    "competitive_advantages": ["adv1", "adv2", "adv3"]
+}}"""
+
+                response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+                
+                json_match = re.search(r'\{[\s\S]*\}', response)
+                if json_match:
+                    return json.loads(json_match.group())
+                    
+            except Exception as e:
+                logger.warning(f"AI competitive comparison failed: {e}")
         
-        # Dynamic SWOT templates as fallback
-        strengths_templates = {
-            'artificial intelligence': ["Advanced AI/ML capabilities", "Strong technical team", "Innovative algorithms", "Data-driven approach"],
-            'financial technology': ["Regulatory compliance expertise", "Secure payment processing", "Financial partnerships", "User-friendly interface"],
-            'healthcare': ["Medical expertise", "Regulatory knowledge", "Patient safety focus", "Clinical validation"],
-            'saas': ["Scalable platform architecture", "Strong customer support", "Integration capabilities", "Subscription model"],
-            'education': ["Educational expertise", "Engaging content", "Learning analytics", "Accessibility features"]
-        }
-        weaknesses_templates = {
-            'artificial intelligence': ["High computational costs", "Data privacy concerns", "Model interpretability", "Talent competition"],
-            'financial technology': ["Regulatory complexity", "Security vulnerabilities", "Market volatility", "Customer acquisition costs"],
-            'healthcare': ["Long sales cycles", "Regulatory barriers", "Integration challenges", "Privacy requirements"],
-            'saas': ["Customer churn", "Competition intensity", "Feature parity", "Pricing pressure"],
-            'education': ["Content creation costs", "Student engagement", "Technology adoption", "Assessment accuracy"]
-        }
-        opportunities_templates = {
-            'artificial intelligence': ["Enterprise AI adoption", "Edge computing", "AI ethics market", "Automation opportunities"],
-            'financial technology': ["Digital banking", "Cryptocurrency integration", "Financial inclusion", "RegTech solutions"],
-            'healthcare': ["Telemedicine growth", "Preventive care", "AI diagnostics", "Personalized medicine"],
-            'saas': ["Remote work tools", "Industry-specific solutions", "API economy", "AI integration"],
-            'education': ["Online learning", "Skills training", "Corporate education", "Gamification"]
-        }
-        threats_templates = {
-            'artificial intelligence': ["AI regulation", "Ethical concerns", "Competition from tech giants", "Talent shortage"],
-            'financial technology': ["Regulatory changes", "Cybersecurity threats", "Economic downturns", "Big tech competition"],
-            'healthcare': ["Regulatory changes", "Privacy regulations", "Competition", "Technology disruption"],
-            'saas': ["Market saturation", "Economic downturns", "Open source competition", "Platform dependencies"],
-            'education': ["Budget constraints", "Technology gaps", "Competition", "Changing learning preferences"]
-        }
-        
-        # Select templates
-        selected_templates = {}
-        for category, templates_dict in zip(['strengths', 'weaknesses', 'opportunities', 'threats'], [strengths_templates, weaknesses_templates, opportunities_templates, threats_templates]):
-            for key, values in templates_dict.items():
-                if key in industry:
-                    selected_templates[category] = values
-                    break
-            if category not in selected_templates:
-                generic = {
-                    'strengths': ["Strong product-market fit", "Experienced team", "Innovative approach", "Customer focus"],
-                    'weaknesses': ["Limited resources", "Brand recognition", "Market penetration", "Competition"],
-                    'opportunities': ["Market expansion", "Partnerships", "New products", "Acquisitions"],
-                    'threats': ["Competition", "Market changes", "Economic factors", "Technology disruption"]
-                }
-                selected_templates[category] = generic[category]
-        
-        # Use fetched if available, else generated
-        hash_value = int(hashlib.md5(company_name.encode()).hexdigest(), 16)
-        random.seed(hash_value)  # For consistent random selection per company
-        strengths = swot_dict['strengths'] or random.sample(selected_templates['strengths'], min(4, len(selected_templates['strengths'])))
-        weaknesses = swot_dict['weaknesses'] or random.sample(selected_templates['weaknesses'], min(4, len(selected_templates['weaknesses'])))
-        opportunities = swot_dict['opportunities'] or random.sample(selected_templates['opportunities'], min(4, len(selected_templates['opportunities'])))
-        threats = swot_dict['threats'] or random.sample(selected_templates['threats'], min(4, len(selected_templates['threats'])))
-        
-        advantages = [
-            f"First-mover advantage in {industry}",
-            f"Superior {stage.lower()} positioning",
-            f"Cost-effective solution for {industry}",
-            f"Agile development process",
-            f"Strong customer relationships",
-            f"Technical innovation leadership"
-        ]
-        competitive_advantages = random.sample(advantages, min(4, len(advantages)))
-        
+        # Fallback
         return {
-            'strengths': strengths,
-            'weaknesses': weaknesses,
-            'opportunities': opportunities,
-            'threats': threats,
-            'competitive_advantages': competitive_advantages
+            'strengths': [
+                f"Strong product differentiation in {industry}",
+                "Experienced leadership team",
+                "Innovative technology approach",
+                "Growing customer base"
+            ],
+            'weaknesses': [
+                "Limited market presence",
+                "Resource constraints",
+                "Brand recognition challenges",
+                "Scaling infrastructure needs"
+            ],
+            'opportunities': [
+                "Expanding market demand",
+                "New geographic markets",
+                "Strategic partnerships",
+                "Product line extension"
+            ],
+            'threats': [
+                f"Competition from {competitors[0] if competitors else 'market leaders'}",
+                "Market volatility",
+                "Regulatory changes",
+                "Technology disruption"
+            ],
+            'competitive_advantages': [
+                f"First-mover advantage in {industry}",
+                f"Superior {stage.lower()} positioning",
+                "Cost-effective solutions",
+                "Strong customer relationships"
+            ]
         }
