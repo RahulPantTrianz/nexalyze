@@ -16,7 +16,7 @@ from enum import Enum
 
 from config.settings import settings
 from database.connections import (
-    neo4j_conn, redis_conn, 
+    redis_conn, 
     cache_get, cache_set, cache_key
 )
 
@@ -310,79 +310,58 @@ class DataService:
             
             return stats
     
-    async def _store_company(
-        self, 
-        company: Company, 
-        retry_count: int = 0
-    ) -> bool:
-        """
-        Store company in Neo4j with retry logic.
-        
-        Args:
-            company: Company dataclass
-            retry_count: Current retry attempt
-        
-        Returns:
-            True if stored successfully
-        """
-        max_retries = 3
-        
+    async def _store_company(self, company: Company) -> bool:
+        """Store company in PostgreSQL"""
+        from database.connections import postgres_conn
+        if not postgres_conn.is_connected():
+            return False
+            
         try:
-            if not neo4j_conn.is_connected():
-                if retry_count < max_retries:
-                    logger.warning(f"Neo4j not connected, reconnecting (attempt {retry_count + 1})")
-                    await asyncio.sleep(1 * (retry_count + 1))
-                    if neo4j_conn.reconnect():
-                        return await self._store_company(company, retry_count + 1)
-                return False
+            # Check if exists
+            existing = postgres_conn.query("SELECT id FROM companies WHERE name = %s", (company.name,))
             
-            with neo4j_conn.driver.session() as session:
-                session.run(
-                    """
-                    MERGE (c:Company {name: $name})
-                    SET c.description = $description,
-                        c.long_description = $long_description,
-                        c.industry = $industry,
-                        c.founded_year = $founded_year,
-                        c.location = $location,
-                        c.website = $website,
-                        c.yc_batch = $yc_batch,
-                        c.funding = $funding,
-                        c.employees = $employees,
-                        c.stage = $stage,
-                        c.is_active = $is_active,
-                        c.tags = $tags,
-                        c.source = $source,
-                        c.updated_at = datetime()
-                    """,
-                    name=company.name,
-                    description=company.description,
-                    long_description=company.long_description,
-                    industry=company.industry,
-                    founded_year=company.founded_year,
-                    location=company.location,
-                    website=company.website,
-                    yc_batch=company.yc_batch,
-                    funding=company.funding,
-                    employees=company.employees,
-                    stage=company.stage,
-                    is_active=company.is_active,
-                    tags=company.tags,
-                    source=company.source
+            if existing:
+                # Update
+                sql = """
+                    UPDATE companies SET
+                        description = %s, industry = %s, location = %s,
+                        website = %s, founded_year = %s, yc_batch = %s,
+                        funding = %s, employees = %s, stage = %s,
+                        tags = %s, updated_at = NOW()
+                    WHERE name = %s
+                """
+                params = (
+                    company.description, company.industry, company.location,
+                    company.website, company.founded_year, company.yc_batch,
+                    company.funding, company.employees, company.stage,
+                    company.tags, company.name
                 )
-                return True
-                
-        except Exception as e:
-            if retry_count < max_retries and "Connection" in str(e):
-                logger.warning(f"Retrying store for {company.name}: {e}")
-                await asyncio.sleep(1 * (retry_count + 1))
-                return await self._store_company(company, retry_count + 1)
+            else:
+                # Insert
+                sql = """
+                    INSERT INTO companies (
+                        name, description, industry, location, website,
+                        founded_year, yc_batch, funding, employees, stage,
+                        tags, created_at, updated_at
+                    ) VALUES (
+                        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW(), NOW()
+                    )
+                """
+                params = (
+                    company.name, company.description, company.industry,
+                    company.location, company.website, company.founded_year,
+                    company.yc_batch, company.funding, company.employees,
+                    company.stage, company.tags
+                )
             
+            return postgres_conn.execute(sql, params)
+            
+        except Exception as e:
             logger.error(f"Failed to store company {company.name}: {e}")
             return False
-    
+
     async def search_companies(
-        self, 
+        self,
         query: str, 
         limit: int = 10,
         filters: Dict[str, Any] = None
@@ -417,17 +396,18 @@ class DataService:
         
         results = []
         
-        # Try Neo4j first
-        if neo4j_conn.is_connected():
+        # Try PostgreSQL first
+        from database.connections import postgres_conn
+        if postgres_conn.is_connected():
             try:
-                results = await self._search_neo4j(query, limit, filters)
-                logger.info(f"Neo4j returned {len(results)} companies")
+                results = await self._search_postgres(query, limit, filters)
+                logger.info(f"PostgreSQL returned {len(results)} companies")
             except Exception as e:
-                logger.warning(f"Neo4j search failed: {e}")
+                logger.warning(f"PostgreSQL search failed: {e}")
         
         # Fallback to curated sample data if no results
         if not results:
-            logger.info("No Neo4j results, using sample data")
+            logger.info("No results, using sample data")
             results = self._get_sample_companies(query, limit)
         
         # Cache results
@@ -436,84 +416,63 @@ class DataService:
         
         return results
     
-    async def _search_neo4j(
+    async def _search_postgres(
         self, 
         query: str, 
         limit: int,
         filters: Dict[str, Any] = None
     ) -> List[Dict[str, Any]]:
-        """Execute Neo4j search query"""
+        """Execute PostgreSQL search query"""
+        from database.connections import postgres_conn
         
         # Build filter conditions
         filter_conditions = []
-        params = {"query": query.lower(), "limit": limit}
+        params = [f"%{query.lower()}%", f"%{query.lower()}%", f"%{query.lower()}%"]
         
         if filters:
             if filters.get("industry"):
-                filter_conditions.append("AND toLower(c.industry) CONTAINS toLower($industry)")
-                params["industry"] = filters["industry"]
+                filter_conditions.append("AND LOWER(industry) LIKE %s")
+                params.append(f"%{filters['industry'].lower()}%")
             
             if filters.get("location"):
-                filter_conditions.append("AND toLower(c.location) CONTAINS toLower($location)")
-                params["location"] = filters["location"]
+                filter_conditions.append("AND LOWER(location) LIKE %s")
+                params.append(f"%{filters['location'].lower()}%")
             
             if filters.get("stage"):
-                filter_conditions.append("AND c.stage = $stage")
-                params["stage"] = filters["stage"]
+                filter_conditions.append("AND stage = %s")
+                params.append(filters["stage"])
             
             if filters.get("min_year"):
-                filter_conditions.append("AND c.founded_year >= $min_year")
-                params["min_year"] = filters["min_year"]
+                filter_conditions.append("AND founded_year >= %s")
+                params.append(filters["min_year"])
         
         filter_str = " ".join(filter_conditions)
         
-        cypher = f"""
-            MATCH (c:Company)
+        sql = f"""
+            SELECT 
+                id, name, description, industry, founded_year, location,
+                website, yc_batch, funding, employees, stage, tags
+            FROM companies
             WHERE (
-                toLower(c.name) CONTAINS $query
-                OR toLower(c.description) CONTAINS $query
-                OR toLower(c.industry) CONTAINS $query
-                OR toLower(c.long_description) CONTAINS $query
+                LOWER(name) LIKE %s
+                OR LOWER(description) LIKE %s
+                OR LOWER(industry) LIKE %s
             )
             {filter_str}
-            RETURN 
-                c.name as name,
-                c.description as description,
-                c.industry as industry,
-                c.founded_year as founded_year,
-                c.location as location,
-                c.website as website,
-                c.yc_batch as yc_batch,
-                c.funding as funding,
-                c.employees as employees,
-                c.stage as stage,
-                c.tags as tags,
-                id(c) as company_id
             ORDER BY 
-                CASE WHEN toLower(c.name) CONTAINS $query THEN 0 ELSE 1 END,
-                c.founded_year DESC
-            LIMIT $limit
+                CASE WHEN LOWER(name) LIKE %s THEN 0 ELSE 1 END,
+                founded_year DESC
+            LIMIT %s
         """
         
-        results = neo4j_conn.query(cypher, params)
+        # Add sort param and limit
+        params.append(f"%{query.lower()}%")
+        params.append(limit)
         
-        return [
-            {
-                'id': r.get('company_id'),
-                'name': r.get('name'),
-                'description': r.get('description'),
-                'industry': r.get('industry'),
-                'founded_year': r.get('founded_year'),
-                'location': r.get('location'),
-                'website': r.get('website'),
-                'yc_batch': r.get('yc_batch'),
-                'funding': r.get('funding'),
-                'employees': r.get('employees'),
-                'stage': r.get('stage'),
-                'tags': r.get('tags', [])
-            }
-            for r in results
-        ]
+        results = postgres_conn.query(sql, tuple(params))
+        
+        return results
+
     
     async def get_company_details(self, company_id: int) -> Dict[str, Any]:
         """Get detailed company information by ID"""
@@ -523,64 +482,45 @@ class DataService:
         if cached:
             return cached
         
-        # Query Neo4j
-        if neo4j_conn.is_connected():
-            results = neo4j_conn.query(
+        # Query PostgreSQL
+        from database.connections import postgres_conn
+        if postgres_conn.is_connected():
+            results = postgres_conn.query(
                 """
-                MATCH (c:Company) WHERE id(c) = $company_id
-                RETURN c.name as name, c.description as description,
-                       c.long_description as long_description,
-                       c.industry as industry, c.founded_year as founded_year,
-                       c.location as location, c.website as website,
-                       c.yc_batch as yc_batch, c.funding as funding,
-                       c.employees as employees, c.stage as stage,
-                       c.tags as tags, id(c) as company_id
+                SELECT * FROM companies WHERE id = %s
                 """,
-                {"company_id": company_id}
+                (company_id,)
             )
             
             if results:
                 company = results[0]
-                result = {
-                    'id': company.get('company_id'),
-                    'name': company.get('name'),
-                    'description': company.get('description'),
-                    'long_description': company.get('long_description'),
-                    'industry': company.get('industry'),
-                    'founded_year': company.get('founded_year'),
-                    'location': company.get('location'),
-                    'website': company.get('website'),
-                    'yc_batch': company.get('yc_batch'),
-                    'funding': company.get('funding'),
-                    'employees': company.get('employees'),
-                    'stage': company.get('stage'),
-                    'tags': company.get('tags', [])
-                }
-                
                 # Cache for 24 hours
-                cache_set(cache_key("company", str(company_id)), result, ttl=settings.cache_ttl_company)
-                return result
+                cache_set(cache_key("company", str(company_id)), company, ttl=settings.cache_ttl_company)
+                return company
         
         # Fallback
         return self._get_fallback_company(company_id)
     
     async def get_company_count(self) -> int:
         """Get total number of companies in database"""
-        if not neo4j_conn.is_connected():
+        from database.connections import postgres_conn
+        if not postgres_conn.is_connected():
             return 0
         
-        results = neo4j_conn.query("MATCH (c:Company) RETURN count(c) as total")
+        results = postgres_conn.query("SELECT COUNT(*) as total FROM companies")
         return results[0].get('total', 0) if results else 0
     
     async def get_industry_distribution(self) -> Dict[str, int]:
         """Get company distribution by industry"""
-        if not neo4j_conn.is_connected():
+        from database.connections import postgres_conn
+        if not postgres_conn.is_connected():
             return {}
         
-        results = neo4j_conn.query("""
-            MATCH (c:Company)
-            WHERE c.industry IS NOT NULL
-            RETURN c.industry as industry, count(*) as count
+        results = postgres_conn.query("""
+            SELECT industry, COUNT(*) as count
+            FROM companies
+            WHERE industry IS NOT NULL
+            GROUP BY industry
             ORDER BY count DESC
             LIMIT 20
         """)
@@ -589,217 +529,22 @@ class DataService:
     
     async def get_location_distribution(self) -> Dict[str, int]:
         """Get company distribution by location"""
-        if not neo4j_conn.is_connected():
+        from database.connections import postgres_conn
+        if not postgres_conn.is_connected():
             return {}
         
-        results = neo4j_conn.query("""
-            MATCH (c:Company)
-            WHERE c.location IS NOT NULL
-            RETURN c.location as location, count(*) as count
+        results = postgres_conn.query("""
+            SELECT location, COUNT(*) as count
+            FROM companies
+            WHERE location IS NOT NULL
+            GROUP BY location
             ORDER BY count DESC
             LIMIT 20
         """)
         
         return {r['location']: r['count'] for r in results}
     
-    async def get_knowledge_graph(self, company_id: int) -> Dict[str, Any]:
-        """Get knowledge graph data for visualization"""
-        if not neo4j_conn.is_connected():
-            return {'nodes': [], 'edges': []}
-        
-        results = neo4j_conn.query(
-            """
-            MATCH (c:Company) WHERE id(c) = $company_id
-            OPTIONAL MATCH (c)-[r]-(related)
-            RETURN c, type(r) as rel_type, related
-            LIMIT 20
-            """,
-            {"company_id": company_id}
-        )
-        
-        nodes = []
-        edges = []
-        company_added = False
-        
-        for record in results:
-            company = record.get('c')
-            
-            if not company_added and company:
-                nodes.append({
-                    'id': f"company_{company_id}",
-                    'label': company.get('name', f'Company {company_id}'),
-                    'group': 'company',
-                    'size': 30,
-                    'color': '#1f77b4'
-                })
-                company_added = True
-            
-            if record.get('related'):
-                related = record['related']
-                related_id = f"related_{len(nodes)}"
-                nodes.append({
-                    'id': related_id,
-                    'label': related.get('name', 'Related Entity'),
-                    'group': 'related',
-                    'size': 20,
-                    'color': '#ff7f0e'
-                })
-                edges.append({
-                    'from': f"company_{company_id}",
-                    'to': related_id,
-                    'label': record.get('rel_type', 'related')
-                })
-        
-        if not nodes:
-            nodes, edges = self._create_fallback_graph(company_id)
-        
-        return {'nodes': nodes, 'edges': edges}
-    
-    async def get_knowledge_graph_by_name(self, company_name: str) -> Dict[str, Any]:
-        """Get knowledge graph by company name"""
-        if not neo4j_conn.is_connected():
-            return {'nodes': [], 'edges': [], 'ai_enhanced': False}
-        
-        # Find company
-        results = neo4j_conn.query(
-            """
-            MATCH (c:Company)
-            WHERE toLower(c.name) = toLower($name)
-            RETURN c, id(c) as company_id
-            LIMIT 1
-            """,
-            {"name": company_name}
-        )
-        
-        if results:
-            company_id = results[0].get('company_id')
-            graph_data = await self.get_knowledge_graph(company_id)
-            graph_data['company_name'] = company_name
-            graph_data['ai_enhanced'] = len(graph_data['nodes']) > 1
-            return graph_data
-        
-        # Create AI-enhanced graph if company not found
-        return await self._create_ai_knowledge_graph(company_name)
-    
-    async def _create_ai_knowledge_graph(self, company_name: str) -> Dict[str, Any]:
-        """Create AI-enhanced knowledge graph for unknown companies"""
-        try:
-            from agents.crew_manager import CrewManager
-            crew_manager = CrewManager()
-            
-            # Get AI analysis
-            prompt = f"""Analyze "{company_name}" and provide its business ecosystem in JSON:
-            {{
-                "competitors": ["Competitor 1", "Competitor 2", "Competitor 3"],
-                "partners": ["Partner 1", "Partner 2"],
-                "technologies": ["Tech 1", "Tech 2"],
-                "markets": ["Market 1", "Market 2"]
-            }}
-            Use real company/technology names where possible."""
-            
-            response = await crew_manager.handle_conversation(prompt, f"kg_{company_name}")
-            
-            # Parse response
-            analysis = {}
-            if isinstance(response, dict) and 'response' in response:
-                response_text = response['response']
-                json_match = re.search(r'\{[\s\S]*\}', response_text)
-                if json_match:
-                    analysis = json.loads(json_match.group())
-            
-            # Build graph
-            nodes = [{
-                'id': 'main',
-                'label': company_name,
-                'group': 'main_company',
-                'size': 40,
-                'color': '#1f77b4'
-            }]
-            edges = []
-            
-            node_configs = {
-                'competitors': ('#ff7f0e', 'competes_with'),
-                'partners': ('#2ca02c', 'partners_with'),
-                'technologies': ('#d62728', 'uses'),
-                'markets': ('#9467bd', 'serves')
-            }
-            
-            for category, (color, rel_type) in node_configs.items():
-                for idx, item in enumerate(analysis.get(category, [])[:5]):
-                    node_id = f"{category}_{idx}"
-                    nodes.append({
-                        'id': node_id,
-                        'label': item,
-                        'group': category,
-                        'size': 20,
-                        'color': color
-                    })
-                    edges.append({
-                        'from': 'main',
-                        'to': node_id,
-                        'label': rel_type
-                    })
-            
-            return {
-                'nodes': nodes,
-                'edges': edges,
-                'company_name': company_name,
-                'ai_enhanced': True,
-                'total_nodes': len(nodes),
-                'total_edges': len(edges)
-            }
-            
-        except Exception as e:
-            logger.error(f"AI knowledge graph creation failed: {e}")
-            return self._create_fallback_knowledge_graph(company_name)
-    
-    def _create_fallback_knowledge_graph(self, company_name: str) -> Dict[str, Any]:
-        """Create fallback knowledge graph"""
-        nodes = [
-            {'id': 'main', 'label': company_name, 'group': 'main_company', 'size': 40, 'color': '#1f77b4'},
-            {'id': 'comp1', 'label': 'Industry Leader', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'comp2', 'label': 'Market Player', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'tech1', 'label': 'Cloud Platform', 'group': 'technology', 'size': 20, 'color': '#d62728'},
-            {'id': 'market1', 'label': 'Target Market', 'group': 'market', 'size': 20, 'color': '#9467bd'},
-        ]
-        edges = [
-            {'from': 'main', 'to': 'comp1', 'label': 'competes_with'},
-            {'from': 'main', 'to': 'comp2', 'label': 'competes_with'},
-            {'from': 'main', 'to': 'tech1', 'label': 'uses'},
-            {'from': 'main', 'to': 'market1', 'label': 'serves'},
-        ]
-        return {
-            'nodes': nodes,
-            'edges': edges,
-            'company_name': company_name,
-            'ai_enhanced': False
-        }
-    
-    def _create_fallback_graph(self, company_id: int) -> Tuple[List, List]:
-        """Create fallback graph structure"""
-        nodes = [
-            {'id': f'company_{company_id}', 'label': f'Company {company_id}', 'group': 'company', 'size': 30, 'color': '#1f77b4'},
-            {'id': 'competitor_1', 'label': 'Competitor A', 'group': 'competitor', 'size': 25, 'color': '#ff7f0e'},
-            {'id': 'investor_1', 'label': 'Investor X', 'group': 'investor', 'size': 20, 'color': '#2ca02c'}
-        ]
-        edges = [
-            {'from': f'company_{company_id}', 'to': 'competitor_1', 'label': 'competes_with'},
-            {'from': f'company_{company_id}', 'to': 'investor_1', 'label': 'funded_by'}
-        ]
-        return nodes, edges
-    
-    def _get_fallback_company(self, company_id: int) -> Dict[str, Any]:
-        """Get fallback company data"""
-        return {
-            'id': company_id,
-            'name': f'Company {company_id}',
-            'description': 'Company details not available',
-            'industry': 'Unknown',
-            'founded_year': 2020,
-            'location': 'Unknown',
-            'website': 'N/A',
-            'yc_batch': 'N/A'
-        }
+
     
     def _get_sample_companies(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """Get curated sample companies based on search query"""

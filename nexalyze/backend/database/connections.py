@@ -10,8 +10,6 @@ from typing import Optional, Dict, Any, List
 from contextlib import contextmanager
 import json
 
-from neo4j import GraphDatabase, Driver
-from neo4j.exceptions import ServiceUnavailable, SessionExpired
 import psycopg2
 from psycopg2 import pool
 import redis
@@ -19,184 +17,6 @@ import redis
 from config.settings import settings
 
 logger = logging.getLogger(__name__)
-
-
-class Neo4jConnection:
-    """
-    Neo4j connection manager with connection pooling, retry logic,
-    and health monitoring.
-    """
-    
-    def __init__(self):
-        self.driver: Optional[Driver] = None
-        self.max_retries = 10
-        self.retry_delay = 2
-        self._last_health_check = 0
-        self._health_check_interval = 30  # seconds
-        self._is_healthy = False
-    
-    def _verify_connection(self) -> bool:
-        """Verify the connection is actually working"""
-        if not self.driver:
-            return False
-        try:
-            with self.driver.session() as session:
-                result = session.run("RETURN 1 AS result")
-                result.single()
-            return True
-        except Exception as e:
-            logger.warning(f"Neo4j connection verification failed: {e}")
-            return False
-    
-    def connect(self, retry_count: int = 0) -> bool:
-        """
-        Connect to Neo4j with exponential backoff retry logic.
-        
-        Args:
-            retry_count: Current retry attempt number
-        
-        Returns:
-            True if connection successful, False otherwise
-        """
-        try:
-            self.driver = GraphDatabase.driver(
-                settings.neo4j_uri,
-                auth=(settings.neo4j_user, settings.neo4j_password),
-                connection_timeout=settings.neo4j_connection_timeout,
-                max_connection_lifetime=3600,
-                max_connection_pool_size=settings.neo4j_max_connection_pool_size,
-                fetch_size=1000,
-                connection_acquisition_timeout=60
-            )
-            
-            if self._verify_connection():
-                self._is_healthy = True
-                logger.info("Connected to Neo4j successfully")
-                return True
-            else:
-                self.driver.close()
-                self.driver = None
-                raise Exception("Connection verification failed")
-                
-        except Exception as e:
-            if retry_count < self.max_retries:
-                wait_time = min(self.retry_delay * (2 ** retry_count), 60)
-                logger.warning(
-                    f"Failed to connect to Neo4j (attempt {retry_count + 1}/{self.max_retries}): {e}. "
-                    f"Retrying in {wait_time}s..."
-                )
-                time.sleep(wait_time)
-                return self.connect(retry_count + 1)
-            else:
-                logger.error(f"Failed to connect to Neo4j after {self.max_retries} attempts: {e}")
-                return False
-    
-    def is_connected(self) -> bool:
-        """Check if connection is alive with caching"""
-        current_time = time.time()
-        
-        # Use cached health status if recent
-        if current_time - self._last_health_check < self._health_check_interval:
-            return self._is_healthy
-        
-        # Perform actual health check
-        self._last_health_check = current_time
-        self._is_healthy = self._verify_connection()
-        return self._is_healthy
-    
-    def reconnect(self) -> bool:
-        """Force reconnection to Neo4j"""
-        if self.driver:
-            try:
-                self.driver.close()
-            except Exception as e:
-                logger.warning(f"Error closing existing Neo4j connection: {e}")
-        self.driver = None
-        self._is_healthy = False
-        return self.connect()
-    
-    @contextmanager
-    def session(self):
-        """
-        Context manager for Neo4j sessions with automatic error handling.
-        
-        Usage:
-            with neo4j_conn.session() as session:
-                result = session.run("MATCH (n) RETURN n LIMIT 10")
-        """
-        if not self.is_connected():
-            self.reconnect()
-        
-        if not self.driver:
-            raise Exception("Neo4j connection not available")
-        
-        session = self.driver.session()
-        try:
-            yield session
-        except (ServiceUnavailable, SessionExpired) as e:
-            logger.warning(f"Neo4j session error, reconnecting: {e}")
-            self.reconnect()
-            raise
-        finally:
-            session.close()
-    
-    def query(self, cypher: str, parameters: Dict[str, Any] = None) -> List[Dict]:
-        """
-        Execute a Cypher query and return results as list of dicts.
-        
-        Args:
-            cypher: Cypher query string
-            parameters: Query parameters
-        
-        Returns:
-            List of result records as dictionaries
-        """
-        if not self.is_connected():
-            if not self.reconnect():
-                return []
-        
-        try:
-            with self.driver.session() as session:
-                result = session.run(cypher, parameters or {})
-                return [dict(record) for record in result]
-        except Exception as e:
-            logger.error(f"Neo4j query failed: {e}")
-            return []
-    
-    def execute(self, cypher: str, parameters: Dict[str, Any] = None) -> bool:
-        """
-        Execute a Cypher statement (write operation).
-        
-        Args:
-            cypher: Cypher statement
-            parameters: Query parameters
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if not self.is_connected():
-            if not self.reconnect():
-                return False
-        
-        try:
-            with self.driver.session() as session:
-                session.run(cypher, parameters or {})
-            return True
-        except Exception as e:
-            logger.error(f"Neo4j execute failed: {e}")
-            return False
-    
-    def close(self):
-        """Safely close the Neo4j connection"""
-        if self.driver:
-            try:
-                self.driver.close()
-                logger.info("Neo4j connection closed")
-            except Exception as e:
-                logger.warning(f"Error closing Neo4j connection: {e}")
-            finally:
-                self.driver = None
-                self._is_healthy = False
 
 
 class PostgresConnection:
@@ -475,7 +295,6 @@ class RedisConnection:
 # Global Connection Instances
 # ===========================================
 
-neo4j_conn = Neo4jConnection()
 postgres_conn = PostgresConnection()
 redis_conn = RedisConnection()
 
@@ -489,14 +308,12 @@ async def init_databases() -> Dict[str, bool]:
     """
     logger.info("Initializing database connections...")
     
-    # Connect to all databases (these have internal retry logic)
-    neo4j_connected = neo4j_conn.connect()
+    # Connect to databases (these have internal retry logic)
     postgres_connected = postgres_conn.connect()
     redis_connected = redis_conn.connect()
     
     # Log status
     status = {
-        "neo4j": neo4j_connected,
         "postgres": postgres_connected,
         "redis": redis_connected
     }
@@ -505,8 +322,6 @@ async def init_databases() -> Dict[str, bool]:
         logger.info("All databases connected successfully!")
     else:
         logger.warning("Some database connections failed:")
-        if not neo4j_connected:
-            logger.warning("  - Neo4j: FAILED (knowledge graph features will not work)")
         if not postgres_connected:
             logger.warning("  - PostgreSQL: FAILED (structured data storage will not work)")
         if not redis_connected:
@@ -523,10 +338,6 @@ def get_health_status() -> Dict[str, Any]:
         Dictionary with detailed health status
     """
     return {
-        "neo4j": {
-            "connected": neo4j_conn.is_connected(),
-            "healthy": neo4j_conn._is_healthy
-        },
         "postgres": {
             "connected": postgres_conn.is_connected(),
             "healthy": postgres_conn._is_healthy

@@ -7,10 +7,10 @@ from services.data_service import DataService
 from services.research_service import ResearchService
 from services.report_service import ReportService
 from services.hacker_news_service import HackerNewsService
-from services.web_scraper_service import ScraperService
+from services.scraper_service import ScraperService
 from services.competitive_intelligence_service import competitive_intel_service
 from services.gemini_service import get_gemini_service
-from services.data_sources_external import DataSources
+from services.external_data_service import DataSources
 from config.settings import settings
 import logging
 import os
@@ -182,17 +182,18 @@ async def cleanup_old_reports(days_old: int = 7):
 async def get_stats():
     """Get system statistics"""
     try:
-        # Import Neo4j connection instance
-        from database.connections import neo4j_conn
+        # Import PostgreSQL connection instance
+        from database.connections import postgres_conn
         
-        # Get company count from Neo4j
-        if neo4j_conn.driver:
-            with neo4j_conn.driver.session() as session:
-                result = session.run("MATCH (c:Company) RETURN count(c) as total")
-                record = result.single()
-                company_count = record["total"] if record else 0
-        else:
-            company_count = 0
+        # Get company count from PostgreSQL
+        company_count = 0
+        if postgres_conn.is_connected():
+            try:
+                results = postgres_conn.query("SELECT COUNT(*) as total FROM companies")
+                if results:
+                    company_count = results[0].get("total", 0)
+            except Exception:
+                pass
         
         return {
             "success": True,
@@ -216,217 +217,8 @@ async def get_stats():
             }
         }
 
-@router.post("/generate-knowledge-graph")
-async def generate_knowledge_graph(request: dict):
-    """Generate AI-powered knowledge graph as PNG image"""
-    try:
-        company_name = request.get("company_name", "")
-        
-        if not company_name:
-            raise HTTPException(status_code=400, detail="Company name is required")
-        
-        logger.info(f"Generating AI knowledge graph for: {company_name}")
-        
-        # Use AI to analyze company
-        crew_manager = CrewManager()
-        
-        # Get AI analysis - Enhanced prompt for more dynamic results
-        analysis_prompt = f"""You are analyzing {company_name}'s business ecosystem. Provide SPECIFIC, REAL-WORLD analysis:
 
-**CRITICAL REQUIREMENTS:**
-1. Use REAL company names, not generic placeholders like "Competitor A" or "Comp 1"
-2. Use SPECIFIC technology names, not vague terms
-3. Use ACTUAL market opportunities, not generic statements
-4. Be CONCRETE and SPECIFIC in every item
 
-**Analysis Required:**
-1. **Top 5 Key Dependencies**: Name the SPECIFIC suppliers, cloud providers, payment processors, or critical technology platforms {company_name} relies on. Examples: "AWS", "Stripe", "Google Cloud", "Twilio", "MongoDB"
-
-2. **Top 5 Business Opportunities**: Identify SPECIFIC, ACTIONABLE growth opportunities based on current market trends. Examples: "Expand to enterprise SaaS", "Launch mobile app", "Enter Asian markets", "Add AI features"
-
-3. **Top 5 Risks & Challenges**: Name SPECIFIC threats and challenges. Examples: "Google competition", "GDPR compliance", "Customer churn", "Funding runway", "Tech debt"
-
-4. **Top 5 Main Competitors**: List ACTUAL competing companies by name. Research and name real competitors in {company_name}'s industry. Examples: If analyzing Airbnb, mention "Booking.com", "VRBO", "Expedia", "Hotels.com"
-
-**Output Format** (JSON ONLY, NO OTHER TEXT):
-{{
-    "dependencies": ["Specific Tech 1", "Specific Platform 2", "Actual Service 3", "Real Provider 4", "Named System 5"],
-    "opportunities": ["Concrete Opportunity 1", "Specific Market 2", "Real Strategy 3", "Actionable Plan 4", "Named Initiative 5"],
-    "risks": ["Specific Risk 1", "Named Threat 2", "Actual Challenge 3", "Real Concern 4", "Concrete Issue 5"],
-    "competitors": ["Real Competitor 1", "Actual Company 2", "Named Rival 3", "Specific Business 4", "Known Player 5"]
-}}
-
-**IMPORTANT**: Each item must be 2-8 words. NO generic placeholders. Use REAL names and SPECIFIC details."""
-        
-        # Get AI response using correct method
-        try:
-            analysis_result = await crew_manager.handle_conversation(analysis_prompt, "knowledge_graph")
-            logger.info(f"AI analysis received for {company_name}")
-            
-            # Handle both dict and string responses
-            if isinstance(analysis_result, dict):
-                # If it's already a dict, extract the response text
-                analysis_result = analysis_result.get('response', '') or analysis_result.get('output', '') or str(analysis_result)
-                logger.info("Extracted response from dict")
-            
-            # Ensure it's a string now
-            if not isinstance(analysis_result, str):
-                logger.warning(f"Unexpected response type: {type(analysis_result)}, converting to string")
-                analysis_result = str(analysis_result)
-            
-            # Extract JSON from response
-            import re
-            json_match = re.search(r'\{[\s\S]*?\}', analysis_result)
-            
-            if json_match:
-                analysis = json.loads(json_match.group())
-                logger.info(f"Successfully parsed AI analysis JSON")
-            else:
-                logger.warning("Could not extract JSON, using intelligent fallback based on company")
-                # Provide intelligent fallback based on company type
-                analysis = {
-                    "dependencies": ["AWS/Azure Cloud", "CDN Services", "Payment Gateway", "Analytics Platform", "Security Tools"],
-                    "opportunities": ["International Growth", "Enterprise Sales", "Product Expansion", "Mobile Platform", "AI Integration"],
-                    "risks": ["Market Competition", "Regulatory Compliance", "Customer Retention", "Economic Headwinds", "Tech Disruption"],
-                    "competitors": ["Industry Leader", "Fast-Growing Startup", "Enterprise Player", "Niche Competitor", "Emerging Rival"]
-                }
-        except Exception as e:
-            logger.error(f"AI analysis failed: {e}, using intelligent defaults")
-            analysis = {
-                "dependencies": ["Cloud Infrastructure", "Payment Processor", "API Services", "Data Storage", "Security Platform"],
-                "opportunities": ["Market Expansion", "Feature Launch", "Partnership Growth", "Geographic Scale", "AI/ML Features"],
-                "risks": ["Competitor Pressure", "Regulatory Risks", "Market Volatility", "Funding Challenges", "Tech Evolution"],
-                "competitors": ["Major Player A", "Startup B", "Enterprise C", "Regional D", "Global E"]
-            }
-        
-        # Generate knowledge graph image
-        import matplotlib
-        matplotlib.use('Agg')  # Non-interactive backend
-        import matplotlib.pyplot as plt
-        import matplotlib.patches as mpatches
-        from matplotlib.patches import FancyBboxPatch, Circle, FancyArrowPatch
-        import io
-        import base64
-        
-        # Create figure with white background
-        fig, ax = plt.subplots(figsize=(18, 14), facecolor='white', dpi=150)
-        ax.set_xlim(0, 10)
-        ax.set_ylim(0, 10)
-        ax.axis('off')
-        
-        # Title
-        title_box = FancyBboxPatch((2, 9.2), 6, 0.6, boxstyle="round,pad=0.15",
-                                   facecolor='#667eea', edgecolor='#764ba2', linewidth=4)
-        ax.add_patch(title_box)
-        ax.text(5, 9.5, f"{company_name} Business Ecosystem", 
-                ha='center', va='center', fontsize=32, fontweight='bold', color='white')
-        
-        # Center company node (STAR)
-        from matplotlib.patches import RegularPolygon
-        star = RegularPolygon((5, 5), 5, radius=0.9, orientation=0, 
-                             facecolor='#667eea', edgecolor='#764ba2', linewidth=4)
-        ax.add_patch(star)
-        ax.text(5, 5, company_name[:20], ha='center', va='center', 
-                fontsize=18, fontweight='bold', color='white', wrap=True)
-        
-        # Dependencies (LEFT SIDE) - Teal
-        deps = analysis.get("dependencies", [])[:5]
-        for i, dep in enumerate(deps):
-            y = 7.5 - i * 1.3
-            rect = FancyBboxPatch((0.3, y-0.35), 2.4, 0.7, boxstyle="round,pad=0.15",
-                                  facecolor='#4ecdc4', edgecolor='#44a08d', linewidth=3)
-            ax.add_patch(rect)
-            # Wrap text if too long
-            dep_text = dep[:35] + "..." if len(dep) > 35 else dep
-            ax.text(1.5, y, dep_text, ha='center', va='center', fontsize=11, fontweight='bold', wrap=True)
-            
-            # Arrow to center
-            arrow = FancyArrowPatch((2.7, y), (4.1, 5), arrowstyle='->', mutation_scale=25,
-                                   linewidth=3, color='#44a08d', alpha=0.7)
-            ax.add_patch(arrow)
-        
-        ax.text(1.5, 8.4, "🔗 Dependencies", ha='center', fontsize=16, fontweight='bold', color='#2c3e50')
-        
-        # Competitors (RIGHT SIDE) - Pink/Red
-        comps = analysis.get("competitors", [])[:5]
-        for i, comp in enumerate(comps):
-            y = 7.5 - i * 1.3
-            rect = FancyBboxPatch((7.3, y-0.35), 2.4, 0.7, boxstyle="round,pad=0.15",
-                                  facecolor='#fd79a8', edgecolor='#f5576c', linewidth=3)
-            ax.add_patch(rect)
-            comp_text = comp[:35] + "..." if len(comp) > 35 else comp
-            ax.text(8.5, y, comp_text, ha='center', va='center', fontsize=11, fontweight='bold', wrap=True)
-            
-            # Dashed arrow from center
-            arrow = FancyArrowPatch((5.9, 5), (7.3, y), arrowstyle='->', mutation_scale=25,
-                                   linewidth=3, color='#f5576c', alpha=0.7, linestyle='dashed')
-            ax.add_patch(arrow)
-        
-        ax.text(8.5, 8.4, "🏆 Competitors", ha='center', fontsize=16, fontweight='bold', color='#2c3e50')
-        
-        # Opportunities (TOP) - Light blue
-        opps = analysis.get("opportunities", [])[:4]
-        for i, opp in enumerate(opps):
-            x = 2.5 + i * 1.5
-            rect = FancyBboxPatch((x-0.6, 8.1), 1.2, 0.55, boxstyle="round,pad=0.1",
-                                  facecolor='#a8edea', edgecolor='#74c7cc', linewidth=2)
-            ax.add_patch(rect)
-            opp_text = opp[:20] + "..." if len(opp) > 20 else opp
-            ax.text(x, 8.375, opp_text, ha='center', va='center', fontsize=9, fontweight='bold', wrap=True)
-        
-        ax.text(5, 9, "🎯 Opportunities", ha='center', fontsize=14, fontweight='bold', color='#2c3e50')
-        
-        # Risks (BOTTOM) - Yellow/Orange
-        risks = analysis.get("risks", [])[:4]
-        for i, risk in enumerate(risks):
-            x = 2.5 + i * 1.5
-            rect = FancyBboxPatch((x-0.6, 1.3), 1.2, 0.55, boxstyle="round,pad=0.1",
-                                  facecolor='#ffeaa7', edgecolor='#fab1a0', linewidth=2)
-            ax.add_patch(rect)
-            risk_text = risk[:20] + "..." if len(risk) > 20 else risk
-            ax.text(x, 1.575, risk_text, ha='center', va='center', fontsize=9, fontweight='bold', wrap=True)
-        
-        ax.text(5, 1, "⚠️ Risks & Challenges", ha='center', fontsize=14, fontweight='bold', color='#2c3e50')
-        
-        # Legend
-        legend_elements = [
-            mpatches.Patch(facecolor='#667eea', edgecolor='#764ba2', label='Main Company', linewidth=2),
-            mpatches.Patch(facecolor='#4ecdc4', edgecolor='#44a08d', label='Dependencies', linewidth=2),
-            mpatches.Patch(facecolor='#fd79a8', edgecolor='#f5576c', label='Competitors', linewidth=2),
-            mpatches.Patch(facecolor='#a8edea', label='Opportunities'),
-            mpatches.Patch(facecolor='#ffeaa7', label='Risks & Challenges')
-        ]
-        ax.legend(handles=legend_elements, loc='lower center', fontsize=12, frameon=True, 
-                 fancybox=True, shadow=True, ncol=5, bbox_to_anchor=(0.5, -0.05))
-        
-        # Add watermark
-        ax.text(9.8, 0.1, 'Generated by Nexalyze AI', ha='right', fontsize=9, 
-                color='gray', alpha=0.6, style='italic')
-        
-        # Save to base64
-        buf = io.BytesIO()
-        plt.tight_layout()
-        plt.savefig(buf, format='png', dpi=150, bbox_inches='tight', facecolor='white', edgecolor='none')
-        buf.seek(0)
-        image_base64 = base64.b64encode(buf.read()).decode('utf-8')
-        plt.close('all')
-        
-        logger.info(f"Knowledge graph image generated successfully for {company_name}")
-        
-        return {
-            "success": True,
-            "data": {
-                "image_base64": image_base64,
-                "analysis": analysis
-            },
-            "message": f"Knowledge graph generated for {company_name}"
-        }
-        
-    except Exception as e:
-        logger.error(f"Knowledge graph generation failed: {str(e)}")
-        import traceback
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
 
 # Pydantic models
 class ResearchRequest(BaseModel):
@@ -501,25 +293,7 @@ async def get_company_details(company_id: int):
         logger.error(f"Company details retrieval failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/knowledge-graph/{company_id}")
-async def get_knowledge_graph(company_id: int):
-    """Get knowledge graph data for visualization"""
-    try:
-        graph_data = await data_service.get_knowledge_graph(company_id)
-        return {"success": True, "data": graph_data}
-    except Exception as e:
-        logger.error(f"Knowledge graph retrieval failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
-@router.get("/knowledge-graph/by-name/{company_name}")
-async def get_knowledge_graph_by_name(company_name: str):
-    """Get knowledge graph data by company name"""
-    try:
-        graph_data = await data_service.get_knowledge_graph_by_name(company_name)
-        return {"success": True, "data": graph_data}
-    except Exception as e:
-        logger.error(f"Knowledge graph retrieval failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/chat")
 async def chat_interface(request: ResearchRequest):
@@ -744,16 +518,17 @@ async def sync_all_yc_data():
 async def get_sync_status():
     """Get current sync status and statistics"""
     try:
-        from database.connections import neo4j_conn
+        from database.connections import postgres_conn
         
-        # Get company count from Neo4j
+        # Get company count from PostgreSQL
         company_count = 0
-        if neo4j_conn.is_connected():
+        postgres_connected = postgres_conn.is_connected() if postgres_conn else False
+        
+        if postgres_connected:
             try:
-                with neo4j_conn.driver.session() as session:
-                    result = session.run("MATCH (c:Company) RETURN count(c) as total")
-                    record = result.single()
-                    company_count = record["total"] if record else 0
+                results = postgres_conn.query("SELECT COUNT(*) as total FROM companies")
+                if results:
+                    company_count = results[0].get("total", 0)
             except Exception as e:
                 logger.warning(f"Could not get company count: {e}")
         
@@ -761,12 +536,13 @@ async def get_sync_status():
             "success": True,
             "data": {
                 "total_companies_in_db": company_count,
-                "neo4j_connected": neo4j_conn.is_connected()
+                "postgres_connected": postgres_connected
             }
         }
     except Exception as e:
         logger.error(f"Failed to get sync status: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/reports/generate")
 async def generate_report(request: ReportRequest):
@@ -1906,26 +1682,6 @@ async def ai_discover_competitors(request: AICompanyRequest):
         logger.error(f"AI competitor discovery failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/ai/knowledge-graph")
-async def ai_knowledge_graph(request: AICompanyRequest):
-    """AI-generated knowledge graph data"""
-    try:
-        gemini_service = get_gemini_service()
-        graph_data = await gemini_service.generate_knowledge_graph_data(
-            request.company_name,
-            request.company_data
-        )
-        
-        return {
-            "success": True,
-            "company": request.company_name,
-            "graph_data": graph_data
-        }
-        
-    except Exception as e:
-        logger.error(f"AI knowledge graph failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 @router.post("/ai/swot")
 async def ai_swot_analysis(request: AICompanyRequest):
     """AI-generated SWOT analysis"""
@@ -2022,7 +1778,7 @@ async def check_data_sources_health():
             "yc_api": False,
             "hacker_news": False,
             "serp_api": bool(settings.serp_api_key),
-            "neo4j": False,
+            "postgres": False,
             "redis": False
         }
         
@@ -2042,13 +1798,10 @@ async def check_data_sources_health():
         except:
             pass
         
-        # Test Neo4j
+        # Test PostgreSQL
         try:
-            from database.connections import neo4j_conn
-            if neo4j_conn.driver:
-                with neo4j_conn.driver.session() as session:
-                    session.run("RETURN 1")
-                    status["neo4j"] = True
+            from database.connections import postgres_conn
+            status["postgres"] = postgres_conn.is_connected()
         except:
             pass
         
@@ -2072,3 +1825,4 @@ async def check_data_sources_health():
     except Exception as e:
         logger.error(f"Data sources health check failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+

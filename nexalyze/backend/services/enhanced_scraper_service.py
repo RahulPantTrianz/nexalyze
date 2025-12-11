@@ -33,7 +33,7 @@ import re
 import json
 from datetime import datetime, timedelta
 from config.settings import settings
-from database.connections import neo4j_conn, redis_conn
+from database.connections import redis_conn
 from services.gemini_service import get_gemini_service
 
 logger = logging.getLogger(__name__)
@@ -782,58 +782,9 @@ Return ONLY valid JSON."""
 
     async def store_scraped_companies(self, companies: List[Dict[str, Any]]) -> int:
         """Store scraped companies in Neo4j"""
-        stored_count = 0
-        
-        try:
-            if not neo4j_conn.driver:
-                logger.warning("Neo4j not available, skipping storage")
-                return 0
-            
-            with neo4j_conn.driver.session() as session:
-                for company in companies:
-                    try:
-                        name = company.get('name', '').strip()
-                        if not name or len(name) < 2:
-                            continue
-                        
-                        session.run(
-                            """
-                            MERGE (c:Company {name: $name})
-                            SET c.description = $description,
-                                c.website = $website,
-                                c.source = $source,
-                                c.stage = $stage,
-                                c.industry = $industry,
-                                c.founded_year = $founded_year,
-                                c.location = $location,
-                                c.value_proposition = $value_proposition,
-                                c.target_market = $target_market,
-                                c.ai_enriched = $ai_enriched,
-                                c.updated_at = datetime()
-                            """,
-                            name=name,
-                            description=company.get('description', '')[:1000],
-                            website=company.get('website', ''),
-                            source=company.get('source', ''),
-                            stage=company.get('stage', ''),
-                            industry=company.get('industry', ''),
-                            founded_year=company.get('founded_year', 0),
-                            location=company.get('location', ''),
-                            value_proposition=company.get('value_proposition', ''),
-                            target_market=company.get('target_market', ''),
-                            ai_enriched=company.get('ai_enriched', False)
-                        )
-                        stored_count += 1
-                    except Exception as e:
-                        logger.error(f"Failed to store company {company.get('name')}: {e}")
-                        continue
-            
-            logger.info(f"Stored {stored_count} companies in Neo4j")
-            return stored_count
-            
-        except Exception as e:
-            logger.error(f"Failed to store companies: {e}")
-            return stored_count
+        # Neo4j storage disabled
+        logger.warning("Neo4j storage is disabled/removed. Skipping storage.")
+        return 0
 
 
 # Backwards compatibility alias

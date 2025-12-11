@@ -5,67 +5,19 @@
 #
 # Usage:
 #   Development:  docker-compose up -d
-#   Production:   docker-compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#   Production:   docker-compose --profile production up -d
 #   Full rebuild: docker-compose build --no-cache && docker-compose up -d
 #
 # Environment Variables (required for production):
 #   - GEMINI_API_KEY: Google Gemini API key
 #   - SERP_API_KEY: SerpAPI key (optional, for enhanced search)
-#   - NEO4J_PASSWORD: Neo4j database password
 #   - POSTGRES_PASSWORD: PostgreSQL password
 #
 # =============================================================================
 
 services:
   # ===========================================================================
-  # Neo4j Database - Knowledge Graph Storage
-  # ===========================================================================
-  neo4j:
-    image: neo4j:5.13-community
-    container_name: nexalyze_neo4j
-    hostname: neo4j
-    ports:
-      - "${NEO4J_HTTP_PORT:-7474}:7474"   # Browser/HTTP
-      - "${NEO4J_BOLT_PORT:-7687}:7687"   # Bolt protocol
-    environment:
-      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-nexalyze_secure_123}
-      - NEO4J_server_memory_pagecache_size=${NEO4J_PAGECACHE:-512M}
-      - NEO4J_server_memory_heap_initial__size=${NEO4J_HEAP_INIT:-512M}
-      - NEO4J_server_memory_heap_max__size=${NEO4J_HEAP_MAX:-1G}
-      - NEO4J_PLUGINS=["apoc"]
-      - NEO4J_dbms_security_procedures_allowlist=apoc.*
-      - NEO4J_dbms_security_procedures_unrestricted=apoc.*
-      # Connection settings
-      - NEO4J_server_bolt_listen__address=0.0.0.0:7687
-      - NEO4J_server_http_listen__address=0.0.0.0:7474
-    volumes:
-      - neo4j_data:/data
-      - neo4j_logs:/logs
-      - neo4j_plugins:/plugins
-    networks:
-      - nexalyze_network
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:7474 || exit 1"]
-      interval: 15s
-      timeout: 10s
-      retries: 10
-      start_period: 60s
-    deploy:
-      resources:
-        limits:
-          memory: 2G
-          cpus: '2'
-        reservations:
-          memory: 512M
-    restart: unless-stopped
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "50m"
-        max-file: "3"
-
-  # ===========================================================================
-  # PostgreSQL Database - Structured Data Storage
+  # PostgreSQL Database - Primary Data Storage
   # ===========================================================================
   postgres:
     image: postgres:15-alpine
@@ -173,9 +125,6 @@ services:
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       
       # Database connections
-      - NEO4J_URI=bolt://neo4j:7687
-      - NEO4J_USER=neo4j
-      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-nexalyze_secure_123}
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
       - POSTGRES_DB=${POSTGRES_DB:-nexalyze}
@@ -196,10 +145,8 @@ services:
       - RATE_LIMIT_PERIOD=${RATE_LIMIT_PERIOD:-60}
       
       # CORS settings
-      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:8501,http://localhost:3000}
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000,http://localhost:5173}
     depends_on:
-      neo4j:
-        condition: service_healthy
       postgres:
         condition: service_healthy
       redis:
@@ -231,29 +178,25 @@ services:
         max-file: "5"
 
   # ===========================================================================
-  # Streamlit Frontend - User Interface
+  # React Frontend - User Interface (Production)
   # ===========================================================================
   frontend:
     build:
-      context: ./frontend
+      context: ./frontend-react
       dockerfile: Dockerfile
     container_name: nexalyze_frontend
     hostname: frontend
     ports:
-      - "${FRONTEND_PORT:-8501}:8501"
+      - "${FRONTEND_PORT:-3000}:80"
     environment:
-      - BACKEND_URL=http://backend:8000
-      - STREAMLIT_SERVER_PORT=8501
-      - STREAMLIT_SERVER_ADDRESS=0.0.0.0
-      - STREAMLIT_SERVER_HEADLESS=true
-      - STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
+      - VITE_API_URL=http://backend:8000
     depends_on:
       backend:
         condition: service_healthy
     networks:
       - nexalyze_network
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8501/_stcore/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:80"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -261,10 +204,10 @@ services:
     deploy:
       resources:
         limits:
-          memory: 1G
-          cpus: '1'
-        reservations:
           memory: 256M
+          cpus: '0.5'
+        reservations:
+          memory: 64M
     restart: unless-stopped
     logging:
       driver: "json-file"
@@ -286,12 +229,6 @@ networks:
 # Volumes
 # =============================================================================
 volumes:
-  neo4j_data:
-    driver: local
-  neo4j_logs:
-    driver: local
-  neo4j_plugins:
-    driver: local
   postgres_data:
     driver: local
   redis_data:

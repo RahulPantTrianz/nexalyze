@@ -60,12 +60,6 @@ class Settings(BaseSettings):
     # Database Configuration
     # ===========================================
     
-    neo4j_uri: str = Field(default="bolt://localhost:7687")
-    neo4j_user: str = Field(default="neo4j")
-    neo4j_password: str = Field(default="password123")
-    neo4j_max_connection_pool_size: int = Field(default=50)
-    neo4j_connection_timeout: int = Field(default=30)
-    
     postgres_url: str = Field(
         default="postgresql://postgres:password123@localhost:5432/nexalyze"
     )
@@ -75,6 +69,7 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379")
     redis_max_connections: int = Field(default=100)
     redis_socket_timeout: int = Field(default=30)
+    
     
     # ===========================================
     # External Data Source URLs

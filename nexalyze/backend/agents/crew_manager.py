@@ -337,18 +337,7 @@ Provide detailed, actionable insights."""
         """
         return await self.gemini_service.generate_swot_analysis(company_name, company_data)
 
-    async def generate_knowledge_graph(self, company_name: str, company_data: dict = None):
-        """
-        Generate knowledge graph data
-        
-        Args:
-            company_name: Name of the company
-            company_data: Optional existing company data
-        
-        Returns:
-            Knowledge graph data
-        """
-        return await self.gemini_service.generate_knowledge_graph_data(company_name, company_data)
+
 
     def _get_timestamp(self):
         """Get current timestamp"""

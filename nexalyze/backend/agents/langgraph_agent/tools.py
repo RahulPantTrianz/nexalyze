@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 import logging
 from services.data_service import DataService
 from services.research_service import ResearchService
-from database.connections import neo4j_conn
+
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +28,7 @@ class CompanyAnalysisInput(BaseModel):
     include_competitors: bool = Field(default=True, description="Whether to include competitor analysis")
 
 
-class KnowledgeGraphInput(BaseModel):
-    """Input for knowledge graph tool"""
-    company_name: str = Field(..., description="Name of the company to get knowledge graph for")
+
 
 
 class ReportGenerationInput(BaseModel):
@@ -130,53 +128,7 @@ async def analyze_company_tool(company_name: str, include_competitors: bool = Tr
         return f"Error analyzing company: {str(e)}"
 
 
-@tool("get_knowledge_graph", args_schema=KnowledgeGraphInput)
-async def get_knowledge_graph_tool(company_name: str) -> str:
-    """
-    Get knowledge graph data for a company showing relationships, dependencies, competitors, opportunities, and risks.
-    
-    Use this tool when the user asks about:
-    - Company relationships and connections
-    - Business ecosystem of a company
-    - Dependencies and partnerships
-    - Competitive relationships
-    """
-    try:
-        logger.info(f"Getting knowledge graph for: {company_name}")
-        graph_data = await data_service.get_knowledge_graph_by_name(company_name)
-        
-        if not graph_data or not graph_data.get('nodes'):
-            return f"Could not generate knowledge graph for '{company_name}'. The company may not be in the database."
-        
-        result = f"## Knowledge Graph for {company_name}\n\n"
-        
-        nodes = graph_data.get('nodes', [])
-        edges = graph_data.get('edges', [])
-        
-        result += f"**Graph Statistics:**\n"
-        result += f"- Nodes: {len(nodes)}\n"
-        result += f"- Relationships: {len(edges)}\n\n"
-        
-        # Group nodes by type
-        node_types = {}
-        for node in nodes:
-            node_type = node.get('type', 'unknown')
-            if node_type not in node_types:
-                node_types[node_type] = []
-            node_types[node_type].append(node.get('name', 'Unknown'))
-        
-        for node_type, names in node_types.items():
-            result += f"**{node_type.title()}:**\n"
-            for name in names[:10]:  # Limit to 10 per type
-                result += f"- {name}\n"
-            if len(names) > 10:
-                result += f"- ... and {len(names) - 10} more\n"
-            result += "\n"
-        
-        return result
-    except Exception as e:
-        logger.error(f"Knowledge graph tool failed: {e}")
-        return f"Error getting knowledge graph: {str(e)}"
+
 
 
 @tool("generate_report", args_schema=ReportGenerationInput)
@@ -237,34 +189,35 @@ async def get_company_statistics_tool() -> str:
     - System status
     """
     try:
-        if not neo4j_conn.is_connected():
+        from database.connections import postgres_conn
+        if not postgres_conn.is_connected():
             return "Database is not connected. Please try again later."
         
-        with neo4j_conn.driver.session() as session:
-            # Get total company count
-            result = session.run("MATCH (c:Company) RETURN count(c) as total")
-            record = result.single()
-            total_companies = record["total"] if record else 0
-            
-            # Get industry distribution
-            result = session.run("""
-                MATCH (c:Company)
-                WHERE c.industry IS NOT NULL
-                RETURN c.industry as industry, count(c) as count
-                ORDER BY count DESC
-                LIMIT 10
-            """)
-            industries = [(record["industry"], record["count"]) for record in result]
-            
-            # Get location distribution
-            result = session.run("""
-                MATCH (c:Company)
-                WHERE c.location IS NOT NULL
-                RETURN c.location as location, count(c) as count
-                ORDER BY count DESC
-                LIMIT 10
-            """)
-            locations = [(record["location"], record["count"]) for record in result]
+        # Get total company count
+        result = postgres_conn.query("SELECT COUNT(*) as total FROM companies")
+        total_companies = result[0]["total"] if result else 0
+        
+        # Get industry distribution
+        result = postgres_conn.query("""
+            SELECT industry, COUNT(*) as count
+            FROM companies
+            WHERE industry IS NOT NULL
+            GROUP BY industry
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        industries = [(r["industry"], r["count"]) for r in result]
+        
+        # Get location distribution
+        result = postgres_conn.query("""
+            SELECT location, COUNT(*) as count
+            FROM companies
+            WHERE location IS NOT NULL
+            GROUP BY location
+            ORDER BY count DESC
+            LIMIT 10
+        """)
+        locations = [(r["location"], r["count"]) for r in result]
         
         result = f"## Database Statistics\n\n"
         result += f"**Total Companies:** {total_companies:,}\n\n"
@@ -291,7 +244,6 @@ def get_all_tools() -> List:
     return [
         search_companies_tool,
         analyze_company_tool,
-        get_knowledge_graph_tool,
         generate_report_tool,
         get_company_statistics_tool
     ]

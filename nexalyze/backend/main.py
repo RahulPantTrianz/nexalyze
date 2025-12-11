@@ -19,7 +19,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 
 from config.settings import settings, validate_required_settings
-from database.connections import init_databases, neo4j_conn, postgres_conn, redis_conn
+from database.connections import init_databases, postgres_conn, redis_conn
 from api.routes import router
 from api.exceptions import register_exception_handlers
 
@@ -47,7 +47,6 @@ def setup_logging():
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("neo4j").setLevel(logging.WARNING)
 
 
 setup_logging()
@@ -88,24 +87,6 @@ async def lifespan(app: FastAPI):
     # Initialize databases with retry logic
     db_status = await init_databases()
     
-    # Wait for Neo4j readiness
-    if db_status.get("neo4j"):
-        logger.info("Waiting for Neo4j to be fully ready...")
-        max_wait = 30
-        wait_interval = 2
-        waited = 0
-        
-        while waited < max_wait:
-            if neo4j_conn.is_connected():
-                logger.info("Neo4j is ready!")
-                break
-            await asyncio.sleep(wait_interval)
-            waited += wait_interval
-            logger.info(f"Waiting for Neo4j... ({waited}s/{max_wait}s)")
-        
-        if not neo4j_conn.is_connected():
-            logger.warning("Neo4j not ready after waiting - some features may be limited")
-    
     # Initialize CrewAI manager
     try:
         from agents.crew_manager import CrewManager
@@ -116,7 +97,7 @@ async def lifespan(app: FastAPI):
         crew_manager = None
     
     # Load initial data in background (non-blocking)
-    if db_status.get("neo4j") and neo4j_conn.is_connected():
+    if db_status.get("postgres"):
         logger.info("Starting background data sync...")
         try:
             from services.data_service import DataService
@@ -130,7 +111,7 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning(f"Could not start background data sync: {e}")
     else:
-        logger.warning("Skipping initial data load - Neo4j not connected")
+        logger.warning("Skipping initial data load - PostgreSQL not connected")
     
     logger.info("=" * 60)
     logger.info("Backend startup complete!")
@@ -144,7 +125,6 @@ async def lifespan(app: FastAPI):
     
     # Close database connections gracefully
     try:
-        neo4j_conn.close()
         postgres_conn.close()
         redis_conn.close()
         logger.info("Database connections closed")
@@ -366,7 +346,6 @@ async def health_check():
     global startup_time
     
     # Check database connections
-    neo4j_healthy = neo4j_conn.is_connected() if neo4j_conn else False
     postgres_healthy = postgres_conn.is_connected() if postgres_conn else False
     redis_healthy = redis_conn.is_connected() if redis_conn else False
     
@@ -376,7 +355,7 @@ async def health_check():
         uptime = (datetime.utcnow() - startup_time).total_seconds()
     
     # Overall health status
-    all_healthy = neo4j_healthy and postgres_healthy and redis_healthy
+    all_healthy = postgres_healthy and redis_healthy
     
     health_status = {
         "status": "healthy" if all_healthy else "degraded",
@@ -385,10 +364,6 @@ async def health_check():
         "environment": settings.environment,
         "uptime_seconds": uptime,
         "services": {
-            "neo4j": {
-                "status": "healthy" if neo4j_healthy else "unhealthy",
-                "connected": neo4j_healthy
-            },
             "postgres": {
                 "status": "healthy" if postgres_healthy else "unhealthy",
                 "connected": postgres_healthy
@@ -428,9 +403,9 @@ async def readiness_check():
     Returns 200 only when the service is ready to accept traffic.
     """
     # Check critical services
-    neo4j_ready = neo4j_conn.is_connected() if neo4j_conn else False
+    postgres_ready = postgres_conn.is_connected() if postgres_conn else False
     
-    if neo4j_ready:
+    if postgres_ready:
         return {"status": "ready", "timestamp": datetime.utcnow().isoformat() + "Z"}
     else:
         return JSONResponse(
@@ -447,12 +422,12 @@ async def metrics():
     """
     company_count = 0
     
-    if neo4j_conn.is_connected():
+    # Get company count from PostgreSQL
+    if postgres_conn.is_connected():
         try:
-            with neo4j_conn.driver.session() as session:
-                result = session.run("MATCH (c:Company) RETURN count(c) as total")
-                record = result.single()
-                company_count = record["total"] if record else 0
+            results = postgres_conn.query("SELECT COUNT(*) as total FROM companies")
+            if results:
+                company_count = results[0].get("total", 0)
         except Exception:
             pass
     

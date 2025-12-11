@@ -5,7 +5,7 @@ import json
 import logging
 from datetime import datetime, timedelta
 from config.settings import settings
-from database.connections import neo4j_conn, postgres_conn, redis_conn
+from database.connections import postgres_conn, redis_conn
 import requests
 
 logger = logging.getLogger(__name__)
@@ -359,73 +359,10 @@ class HackerNewsService:
     
     async def store_hn_data(self, company_name: str, mentions_data: Dict[str, List[Dict[str, Any]]]):
         """Store Hacker News data in Neo4j for knowledge graph"""
-        try:
-            if not neo4j_conn.driver:
-                logger.warning("Neo4j not available, skipping data storage")
-                return
-            
-            with neo4j_conn.driver.session() as session:
-                # Create or update company node
-                session.run(
-                    """
-                    MERGE (c:Company {name: $company_name})
-                    SET c.last_hn_update = datetime(),
-                        c.hn_mentions_count = $total_mentions
-                    """,
-                    company_name=company_name,
-                    total_mentions=mentions_data.get('total_mentions', 0)
-                )
-                
-                # Create HN story nodes and relationships
-                for story in mentions_data.get('stories', []):
-                    session.run(
-                        """
-                        MATCH (c:Company {name: $company_name})
-                        MERGE (s:HNStory {id: $story_id})
-                        SET s.title = $title,
-                            s.url = $url,
-                            s.score = $score,
-                            s.time = $time,
-                            s.matched_keyword = $matched_keyword,
-                            s.matched_in = $matched_in
-                        MERGE (c)-[:MENTIONED_IN]->(s)
-                        """,
-                        company_name=company_name,
-                        story_id=story.get('id'),
-                        title=story.get('title', ''),
-                        url=story.get('url', ''),
-                        score=story.get('score', 0),
-                        time=story.get('time', 0),
-                        matched_keyword=story.get('matched_keyword', ''),
-                        matched_in=story.get('matched_in', [])
-                    )
-                
-                # Create HN job nodes and relationships
-                for job in mentions_data.get('jobs', []):
-                    session.run(
-                        """
-                        MATCH (c:Company {name: $company_name})
-                        MERGE (j:HNJob {id: $job_id})
-                        SET j.title = $title,
-                            j.text = $text,
-                            j.time = $time,
-                            j.matched_keyword = $matched_keyword,
-                            j.matched_in = $matched_in
-                        MERGE (c)-[:HIRING_IN]->(j)
-                        """,
-                        company_name=company_name,
-                        job_id=job.get('id'),
-                        title=job.get('title', ''),
-                        text=job.get('text', ''),
-                        time=job.get('time', 0),
-                        matched_keyword=job.get('matched_keyword', ''),
-                        matched_in=job.get('matched_in', [])
-                    )
-                
-                logger.info(f"Stored HN data for {company_name}")
-                
-        except Exception as e:
-            logger.error(f"Error storing HN data for {company_name}: {e}")
+        """Store Hacker News data in Neo4j for knowledge graph"""
+        # Neo4j storage disabled
+        logger.warning("Neo4j storage is disabled/removed. Skipping data storage.")
+        return
     
     def format_hn_item(self, item: Dict[str, Any]) -> Dict[str, Any]:
         """Format HN item for display"""

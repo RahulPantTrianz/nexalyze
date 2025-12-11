@@ -11,7 +11,7 @@ from services.gemini_service import (
     discover_competitors_with_ai
 )
 
-from services.data_sources_external import (
+from services.external_data_service import (
     DataSources,
     get_data_sources
 )
@@ -24,7 +24,7 @@ from services.competitive_intelligence_service import (
 from services.report_service import ReportService
 from services.research_service import ResearchService
 from services.data_service import DataService
-from services.web_scraper_service import ScraperService
+from services.scraper_service import ScraperService
 from services.hacker_news_service import HackerNewsService
 
 __all__ = [

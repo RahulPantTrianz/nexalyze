@@ -402,58 +402,7 @@ Return ONLY a JSON array of competitor company names, nothing else:
         
         return []
     
-    async def generate_knowledge_graph_data(self, company_name: str, company_data: Dict[str, Any] = None) -> Dict[str, Any]:
-        """
-        Generate knowledge graph data for a company
-        
-        Args:
-            company_name: Name of the company
-            company_data: Optional existing company data
-        
-        Returns:
-            Knowledge graph structure with nodes and relationships
-        """
-        context = ""
-        if company_data:
-            context = f"Industry: {company_data.get('industry', 'Technology')}, Location: {company_data.get('location', 'Unknown')}"
-        
-        prompt = f"""Analyze "{company_name}" ({context}) and provide its business ecosystem.
 
-Provide SPECIFIC, REAL company/technology names (not generic placeholders).
-
-Return JSON:
-{{
-    "dependencies": ["Specific Tech/Platform 1", "Cloud Provider", "Key Service", "Partner Tech", "Infrastructure"],
-    "competitors": ["Real Competitor 1", "Real Competitor 2", "Real Competitor 3", "Real Competitor 4", "Real Competitor 5"],
-    "opportunities": ["Specific Growth Opportunity 1", "Market Expansion 2", "Strategic Initiative 3", "New Product 4"],
-    "risks": ["Specific Risk 1", "Market Challenge 2", "Competitive Threat 3", "Operational Risk 4"],
-    "investors": ["Known Investor 1", "VC Firm 2"],
-    "customers": ["Customer Segment 1", "Target Market 2"],
-    "technologies": ["Core Tech 1", "Platform 2", "Framework 3"]
-}}
-
-Return ONLY valid JSON with real names, no generic placeholders."""
-
-        response = await self.generate_content(prompt, temperature=0.4)
-        
-        try:
-            import json
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', response)
-            if json_match:
-                return json.loads(json_match.group())
-        except Exception as e:
-            logger.warning(f"Failed to parse knowledge graph JSON: {e}")
-        
-        return {
-            "dependencies": ["Cloud Infrastructure", "API Services", "Data Platform"],
-            "competitors": ["Industry Leader", "Growing Startup", "Enterprise Player"],
-            "opportunities": ["Market Expansion", "Product Innovation", "Strategic Partnerships"],
-            "risks": ["Competition", "Market Changes", "Technology Evolution"],
-            "investors": [],
-            "customers": ["Enterprise", "SMB"],
-            "technologies": ["Cloud", "AI/ML", "APIs"]
-        }
     
     async def generate_swot_analysis(self, company_name: str, company_data: Dict[str, Any] = None) -> Dict[str, List[str]]:
         """

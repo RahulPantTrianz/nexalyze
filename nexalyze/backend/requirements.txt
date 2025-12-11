@@ -15,7 +15,6 @@ tiktoken>=0.5.0  # Token counting for context management
 psycopg2-binary
 redis
 sqlalchemy
-neo4j
 
 # Data Processing
 pandas
