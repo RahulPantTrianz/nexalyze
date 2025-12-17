@@ -401,11 +401,8 @@ class DataService:
             except Exception as e:
                 logger.warning(f"PostgreSQL search failed: {e}")
         
-        # Fallback to curated sample data if no results AND query is not empty
-        # If query is empty, we only want DB results
-        if not results and query:
-            logger.info("No results, using sample data")
-            results = self._get_sample_companies(query, limit)
+        # Only return actual database results - no fallback to sample data
+        # This ensures search result IDs match database IDs
         
         # Cache results
         if results:
@@ -577,70 +574,7 @@ class DataService:
     
 
     
-    def _get_sample_companies(self, query: str, limit: int) -> List[Dict[str, Any]]:
-        """Get curated sample companies based on search query"""
-        query_lower = query.lower()
-        
-        # Curated company database
-        company_databases = {
-            'ai': [
-                {'id': 1, 'name': 'OpenAI', 'description': 'AI research company focused on creating safe artificial general intelligence', 'industry': 'Artificial Intelligence', 'founded_year': 2015, 'location': 'San Francisco, CA', 'website': 'https://openai.com', 'yc_batch': 'S15', 'funding': '$11.3B', 'employees': '500-1000', 'stage': 'Series C'},
-                {'id': 2, 'name': 'Anthropic', 'description': 'AI safety company developing Claude, a helpful AI assistant', 'industry': 'Artificial Intelligence', 'founded_year': 2021, 'location': 'San Francisco, CA', 'website': 'https://anthropic.com', 'yc_batch': 'S21', 'funding': '$4.1B', 'employees': '200-500', 'stage': 'Series C'},
-                {'id': 3, 'name': 'Cohere', 'description': 'Natural language processing AI platform for enterprises', 'industry': 'Artificial Intelligence', 'founded_year': 2019, 'location': 'Toronto, Canada', 'website': 'https://cohere.ai', 'yc_batch': 'W19', 'funding': '$270M', 'employees': '100-200', 'stage': 'Series C'},
-            ],
-            'fintech': [
-                {'id': 7, 'name': 'Stripe', 'description': 'Online payment processing platform for internet businesses', 'industry': 'Financial Technology', 'founded_year': 2010, 'location': 'San Francisco, CA', 'website': 'https://stripe.com', 'yc_batch': 'S10', 'funding': '$2.2B', 'employees': '3000+', 'stage': 'Series H'},
-                {'id': 8, 'name': 'Coinbase', 'description': 'Cryptocurrency exchange and digital wallet platform', 'industry': 'Financial Technology', 'founded_year': 2012, 'location': 'San Francisco, CA', 'website': 'https://coinbase.com', 'yc_batch': 'S12', 'funding': '$547M', 'employees': '3000+', 'stage': 'Public'},
-                {'id': 9, 'name': 'Plaid', 'description': 'Financial data connectivity platform for fintech apps', 'industry': 'Financial Technology', 'founded_year': 2013, 'location': 'San Francisco, CA', 'website': 'https://plaid.com', 'yc_batch': 'S13', 'funding': '$734M', 'employees': '500-1000', 'stage': 'Acquired'},
-            ],
-            'saas': [
-                {'id': 12, 'name': 'Dropbox', 'description': 'Cloud storage and file synchronization service', 'industry': 'Software as a Service', 'founded_year': 2007, 'location': 'San Francisco, CA', 'website': 'https://dropbox.com', 'yc_batch': 'S07', 'funding': '$1.7B', 'employees': '3000+', 'stage': 'Public'},
-                {'id': 13, 'name': 'Airbnb', 'description': 'Online marketplace for short-term homestays and experiences', 'industry': 'Marketplace', 'founded_year': 2008, 'location': 'San Francisco, CA', 'website': 'https://airbnb.com', 'yc_batch': 'W08', 'funding': '$6.4B', 'employees': '5000+', 'stage': 'Public'},
-                {'id': 14, 'name': 'Twilio', 'description': 'Cloud communications platform for developers', 'industry': 'Software as a Service', 'founded_year': 2008, 'location': 'San Francisco, CA', 'website': 'https://twilio.com', 'yc_batch': 'S08', 'funding': '$1.2B', 'employees': '5000+', 'stage': 'Public'},
-            ],
-            'healthcare': [
-                {'id': 10, 'name': '23andMe', 'description': 'Personal genomics and biotechnology company', 'industry': 'Healthcare', 'founded_year': 2006, 'location': 'Sunnyvale, CA', 'website': 'https://23andme.com', 'yc_batch': 'S06', 'funding': '$791M', 'employees': '500-1000', 'stage': 'Public'},
-            ],
-            'edtech': [
-                {'id': 4, 'name': 'Khan Academy', 'description': 'Free online learning platform with personalized resources', 'industry': 'Education Technology', 'founded_year': 2008, 'location': 'Mountain View, CA', 'website': 'https://khanacademy.org', 'yc_batch': 'S08', 'funding': '$16M', 'employees': '200-500', 'stage': 'Non-profit'},
-                {'id': 5, 'name': 'Duolingo', 'description': 'Language learning platform with gamified lessons', 'industry': 'Education Technology', 'founded_year': 2011, 'location': 'Pittsburgh, PA', 'website': 'https://duolingo.com', 'yc_batch': 'S11', 'funding': '$183M', 'employees': '500-1000', 'stage': 'Public'},
-            ],
-        }
-        
-        # Find matching companies
-        matching = []
-        
-        # Check category matches
-        for category, companies in company_databases.items():
-            if category in query_lower or query_lower in category:
-                matching.extend(companies)
-        
-        # Check company name/description matches
-        for category, companies in company_databases.items():
-            for company in companies:
-                if (query_lower in company['name'].lower() or
-                    query_lower in company['description'].lower() or
-                    query_lower in company['industry'].lower()):
-                    if company not in matching:
-                        matching.append(company)
-        
-        # Keyword-based fallback
-        if not matching:
-            keyword_map = {
-                ('ai', 'artificial', 'intelligence', 'machine', 'learning', 'ml'): 'ai',
-                ('finance', 'fintech', 'payment', 'banking', 'crypto'): 'fintech',
-                ('education', 'learning', 'school', 'university', 'edtech'): 'edtech',
-                ('health', 'medical', 'healthcare', 'bio'): 'healthcare',
-                ('saas', 'software', 'platform', 'cloud'): 'saas',
-            }
-            
-            for keywords, category in keyword_map.items():
-                if any(kw in query_lower for kw in keywords):
-                    matching = company_databases.get(category, [])
-                    break
-        
-        # Default to AI companies
-        if not matching:
-            matching = company_databases['ai']
-        
-        return matching[:limit]
+    def _get_fallback_company(self, company_id: int) -> Dict[str, Any]:
+        """Return None when company not found instead of fake data"""
+        logger.warning(f"Company with ID {company_id} not found in database")
+        return None

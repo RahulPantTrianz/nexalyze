@@ -138,6 +138,10 @@ async def analyze_company_tool(company_name: str, include_competitors: bool = Tr
         if analysis.get('insights'):
             result += f"**Key Insights:**\n{analysis['insights']}\n"
         
+        # Add system note about missing data sources if applicable
+        if not research_service.serp_api_key:
+            result += "\n> **System Note:** detailed financial, funding, and competitor data is currently unavailable because external data sources (SERP API) are not configured. Analysis is based on internal database records only.\n"
+        
         return result
     except Exception as e:
         logger.error(f"Company analysis tool failed: {e}")
@@ -255,12 +259,117 @@ async def get_company_statistics_tool() -> str:
         return f"Error getting statistics: {str(e)}"
 
 
+class ChartGenerationInput(BaseModel):
+    """Input for chart generation tool"""
+    chart_type: str = Field(default="bar", description="Type of chart: pie, bar, line, funding, matrix, table")
+    query: str = Field(default="", description="Query or topic for the chart data")
+    title: str = Field(default="", description="Chart title")
+
+
+@tool("generate_chart", args_schema=ChartGenerationInput)
+async def generate_chart_tool(chart_type: str = "bar", query: str = "", title: str = "") -> str:
+    """
+    Generate a visualization chart based on company data.
+    
+    Chart types:
+    - pie: Distribution chart (industry, location, stage)
+    - bar: Comparison chart (companies, funding, metrics)
+    - line: Trend chart (timeline, growth)
+    - funding: Funding analysis chart
+    - matrix: Competitive comparison matrix
+    - table: Data table visualization
+    
+    Use this tool when the user asks about:
+    - Visualizations or charts
+    - Graphs showing data
+    - Distribution or comparison visuals
+    - Market or company data graphics
+    
+    Returns the chart as base64-encoded image data.
+    """
+    try:
+        from utils.chart_generator import ChartGenerator
+        
+        logger.info(f"Generating {chart_type} chart for query: {query}")
+        
+        # Get relevant data based on query
+        companies = await data_service.search_companies(query, 20) if query else await data_service.search_companies("", 50)
+        
+        if not companies:
+            return "No data available to generate chart. Please try a different query."
+        
+        generator = ChartGenerator()
+        base64_img = ""
+        chart_title = title or f"{query or 'Market'} Analysis"
+        
+        if chart_type == "pie":
+            # Industry distribution
+            industry_data = {}
+            for c in companies:
+                ind = c.get('industry', 'Unknown')
+                industry_data[ind] = industry_data.get(ind, 0) + 1
+            base64_img = generator.generate_pie_chart(industry_data, chart_title)
+            
+        elif chart_type == "bar":
+            # Location or industry distribution
+            location_data = {}
+            for c in companies:
+                loc = c.get('location', 'Unknown')
+                location_data[loc] = location_data.get(loc, 0) + 1
+            base64_img = generator.generate_bar_chart(location_data, chart_title, 
+                                                       xlabel="Location", ylabel="Companies", horizontal=True)
+            
+        elif chart_type == "funding":
+            base64_img = generator.generate_funding_chart(companies, chart_title)
+            
+        elif chart_type == "matrix":
+            base64_img = generator.generate_competitive_matrix(companies, title=chart_title)
+            
+        elif chart_type == "table":
+            columns = ['name', 'industry', 'location', 'stage']
+            base64_img = generator.generate_comparison_table(companies, columns, chart_title)
+        
+        else:  # Default to bar chart
+            industry_data = {}
+            for c in companies:
+                ind = c.get('industry', 'Unknown')
+                industry_data[ind] = industry_data.get(ind, 0) + 1
+            base64_img = generator.generate_bar_chart(industry_data, chart_title)
+        
+        if base64_img:
+            # Return response with chart metadata
+            return f"""✅ **Chart Generated Successfully**
+
+**Type:** {chart_type}
+**Title:** {chart_title}
+**Data Points:** {len(companies)} companies
+
+[CHART_DATA]
+{{
+    "type": "chart",
+    "chart_type": "{chart_type}",
+    "title": "{chart_title}",
+    "image_base64": "{base64_img}",
+    "mime_type": "image/png"
+}}
+[/CHART_DATA]
+
+The chart has been generated and is embedded above. It shows the {chart_type} visualization for {query or 'available data'}."""
+        else:
+            return f"❌ Failed to generate {chart_type} chart. Insufficient data."
+            
+    except Exception as e:
+        logger.error(f"Chart generation tool failed: {e}")
+        return f"Error generating chart: {str(e)}"
+
+
 def get_all_tools() -> List:
     """Get all available tools for the agent"""
     return [
         search_companies_tool,
         analyze_company_tool,
         generate_report_tool,
-        get_company_statistics_tool
+        get_company_statistics_tool,
+        generate_chart_tool
     ]
 

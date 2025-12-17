@@ -374,8 +374,8 @@ async def health_check():
             },
             "ai": {
                 "status": "healthy" if crew_manager else "degraded",
-                "provider": "Google Gemini",
-                "model": settings.gemini_model
+                "provider": "AWS Bedrock",
+                "model": settings.bedrock_model_id
             }
         },
         "features": {

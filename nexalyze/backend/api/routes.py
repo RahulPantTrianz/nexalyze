@@ -631,7 +631,11 @@ async def get_company_details(company_id: int):
     """Get detailed information about a specific company"""
     try:
         company_details = await data_service.get_company_details(company_id)
+        if company_details is None:
+            raise HTTPException(status_code=404, detail=f"Company with ID {company_id} not found")
         return {"success": True, "data": company_details}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Company details retrieval failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -1919,7 +1923,120 @@ async def get_stock_data(symbol: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ==================== GEMINI AI DIRECT ENDPOINTS ====================
+# ==================== CHART GENERATION ENDPOINTS ====================
+
+class ChartRequest(BaseModel):
+    chart_type: str = "bar"  # pie, bar, line, funding, matrix, table
+    query: Optional[str] = ""
+    title: Optional[str] = ""
+    data: Optional[Dict[str, Any]] = None
+
+
+@router.post("/charts/generate")
+async def generate_chart(request: ChartRequest):
+    """
+    Generate a chart with base64-encoded image data.
+    
+    Chart types:
+    - pie: Industry/category distribution
+    - bar: Comparison chart
+    - line: Trend chart
+    - funding: Funding analysis by company
+    - matrix: Competitive comparison matrix
+    - table: Data table visualization
+    
+    Returns base64-encoded PNG image for embedding in frontend.
+    """
+    try:
+        from utils.chart_generator import ChartGenerator
+        
+        logger.info(f"Generating {request.chart_type} chart for query: {request.query}")
+        
+        generator = ChartGenerator()
+        chart_title = request.title or f"{request.query or 'Market'} Analysis"
+        base64_img = ""
+        
+        # Get data if not provided
+        if request.data:
+            chart_data = request.data
+        else:
+            companies = await data_service.search_companies(request.query, 30) if request.query else await data_service.search_companies("", 50)
+            chart_data = {"companies": companies}
+        
+        companies = chart_data.get("companies", [])
+        
+        if request.chart_type == "pie":
+            industry_data = {}
+            for c in companies:
+                ind = c.get('industry', 'Unknown')
+                industry_data[ind] = industry_data.get(ind, 0) + 1
+            base64_img = generator.generate_pie_chart(industry_data, chart_title)
+            
+        elif request.chart_type == "bar":
+            # Location or custom data
+            if chart_data.get("categories"):
+                base64_img = generator.generate_bar_chart(chart_data["categories"], chart_title)
+            else:
+                location_data = {}
+                for c in companies:
+                    loc = c.get('location', 'Unknown')
+                    location_data[loc] = location_data.get(loc, 0) + 1
+                base64_img = generator.generate_bar_chart(location_data, chart_title, horizontal=True)
+                
+        elif request.chart_type == "funding":
+            base64_img = generator.generate_funding_chart(companies, chart_title)
+            
+        elif request.chart_type == "matrix":
+            base64_img = generator.generate_competitive_matrix(companies, title=chart_title)
+            
+        elif request.chart_type == "table":
+            columns = ['name', 'industry', 'location', 'stage', 'funding']
+            base64_img = generator.generate_comparison_table(companies, columns, chart_title)
+            
+        else:
+            # Default to bar chart with industry data
+            industry_data = {}
+            for c in companies:
+                ind = c.get('industry', 'Unknown')
+                industry_data[ind] = industry_data.get(ind, 0) + 1
+            base64_img = generator.generate_bar_chart(industry_data, chart_title)
+        
+        if base64_img:
+            return {
+                "success": True,
+                "chart": {
+                    "type": request.chart_type,
+                    "title": chart_title,
+                    "image_base64": base64_img,
+                    "mime_type": "image/png",
+                    "data_points": len(companies)
+                }
+            }
+        else:
+            raise HTTPException(status_code=400, detail="Failed to generate chart - insufficient data")
+            
+    except Exception as e:
+        logger.error(f"Chart generation failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/charts/types")
+async def get_chart_types():
+    """Get available chart types and their descriptions"""
+    return {
+        "success": True,
+        "chart_types": [
+            {"type": "pie", "name": "Pie Chart", "description": "Distribution chart for categories"},
+            {"type": "bar", "name": "Bar Chart", "description": "Comparison chart for values"},
+            {"type": "line", "name": "Line Chart", "description": "Trend chart over time"},
+            {"type": "funding", "name": "Funding Chart", "description": "Company funding analysis"},
+            {"type": "matrix", "name": "Competitive Matrix", "description": "Company comparison heatmap"},
+            {"type": "table", "name": "Data Table", "description": "Tabular data visualization"}
+        ]
+    }
+
+
+# ==================== BEDROCK AI DIRECT ENDPOINTS ====================
 
 class AIQueryRequest(BaseModel):
     prompt: str
@@ -1977,10 +2094,10 @@ async def ai_analyze_company(request: AICompanyRequest):
 async def ai_discover_competitors(request: AICompanyRequest):
     """AI-powered competitor discovery"""
     try:
-        gemini_service = get_gemini_service()
+        bedrock_service = get_bedrock_service()
         industry = request.company_data.get('industry') if request.company_data else None
         
-        competitors = await gemini_service.discover_competitors(
+        competitors = await bedrock_service.discover_competitors(
             request.company_name,
             industry
         )
@@ -2062,8 +2179,8 @@ async def ai_chat(request: AIQueryRequest):
 async def clear_ai_chat_session(session_id: str):
     """Clear AI chat session"""
     try:
-        gemini_service = get_gemini_service()
-        gemini_service.clear_chat_session(session_id)
+        bedrock_service = get_bedrock_service()
+        bedrock_service.clear_chat_session(session_id)
         
         return {
             "success": True,
@@ -2081,18 +2198,18 @@ async def clear_ai_chat_session(session_id: str):
 async def check_ai_health():
     """Check AI service health"""
     try:
-        gemini_service = get_gemini_service()
+        bedrock_service = get_bedrock_service()
         
         # Quick test
-        response = await gemini_service.generate_content(
+        response = await bedrock_service.generate_text(
             "Say 'OK' to confirm you are working.",
             temperature=0.1
         )
         
         return {
             "success": True,
-            "ai_provider": "Google Gemini",
-            "model": "gemini-1.5-flash",
+            "ai_provider": "AWS Bedrock",
+            "model": settings.bedrock_model_id,
             "status": "healthy" if response else "degraded",
             "test_response": response[:100] if response else None
         }
@@ -2101,7 +2218,7 @@ async def check_ai_health():
         logger.error(f"AI health check failed: {e}")
         return {
             "success": False,
-            "ai_provider": "Google Gemini",
+            "ai_provider": "AWS Bedrock",
             "status": "unhealthy",
             "error": str(e)
         }

@@ -1,5 +1,5 @@
 """
-Multi-Source Scraper Service with Gemini AI
+Multi-Source Scraper Service with Bedrock AI
 Integrates 20+ startup data sources with AI-powered enrichment
 
 Data Sources:
@@ -14,7 +14,7 @@ Data Sources:
 - And more...
 
 Features:
-- Gemini AI-powered data enrichment
+- Bedrock AI-powered data enrichment
 - Intelligent deduplication
 - Comprehensive company profiling
 - Real-time data aggregation
@@ -34,14 +34,14 @@ import json
 from datetime import datetime, timedelta
 from config.settings import settings
 from database.connections import redis_conn
-from services.gemini_service import get_gemini_service
+from services.bedrock_service import get_bedrock_service
 
 logger = logging.getLogger(__name__)
 
 
 class ScraperService:
     """
-    Enhanced multi-source scraper with Gemini AI enrichment
+    Enhanced multi-source scraper with Bedrock AI enrichment
     """
     
     def __init__(self):
@@ -56,7 +56,7 @@ class ScraperService:
         ]
         self.visited_urls: Set[str] = set()
         self.serp_api_key = settings.serp_api_key
-        self.gemini_service = None
+        self.bedrock_service = None
         self.cache: Dict[str, Any] = {}
         self.cache_ttl = 3600  # 1 hour
 
@@ -65,11 +65,11 @@ class ScraperService:
         connector = aiohttp.TCPConnector(ssl=False, limit=20)
         self.session = aiohttp.ClientSession(timeout=timeout, connector=connector)
         
-        # Initialize Gemini service
+        # Initialize Bedrock service
         try:
-            self.gemini_service = get_gemini_service()
+            self.bedrock_service = get_bedrock_service()
         except Exception as e:
-            logger.warning(f"Could not initialize Gemini service: {e}")
+            logger.warning(f"Could not initialize Bedrock service: {e}")
         
         return self
 
@@ -601,8 +601,8 @@ class ScraperService:
     # ==================== AI ENRICHMENT ====================
     
     async def enrich_company_with_ai(self, company_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Use Gemini AI to enrich and clean company data"""
-        if not self.gemini_service:
+        """Use Bedrock AI to enrich and clean company data"""
+        if not self.bedrock_service:
             return company_data
         
         try:
@@ -634,7 +634,7 @@ Return as JSON:
 
 Return ONLY valid JSON."""
 
-            response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+            response = await self.bedrock_service.generate_with_retry(prompt, temperature=0.3)
             
             # Parse response
             json_match = re.search(r'\{[\s\S]*?\}', response)
@@ -673,7 +673,7 @@ Return ONLY valid JSON."""
                     ['yc', 'product_hunt', 'betalist', 'startup_ranking', 
                      'indie_hackers', 'github', 'hacker_news', 'serp']
             limit_per_source: Maximum companies per source
-            use_ai_enrichment: Whether to enrich data with Gemini AI
+            use_ai_enrichment: Whether to enrich data with Bedrock AI
             query: Optional search query for SERP/HN
         """
         if not sources:
@@ -747,8 +747,8 @@ Return ONLY valid JSON."""
                         unique_companies.append(company)
                 
                 # AI enrichment for top companies
-                if use_ai_enrichment and self.gemini_service:
-                    logger.info("Enriching top companies with Gemini AI...")
+                if use_ai_enrichment and self.bedrock_service:
+                    logger.info("Enriching top companies with Bedrock AI...")
                     enrichment_limit = min(20, len(unique_companies))
                     
                     for i in range(enrichment_limit):

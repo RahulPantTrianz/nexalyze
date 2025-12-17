@@ -16,14 +16,16 @@ bedrock_service = get_bedrock_service()
 
 CONTENT_TABLE_PROMPT = """You are an expert report content planner. Your task is to create a structured content table for a {report_type} report on the topic: {topic}.
 
-Based on the available data and the report type, create a comprehensive content table with sections that will guide the report generation.
+Based on the available data and the report type, create a CONCISE content table with the MOST ESSENTIAL sections only.
 
-**Report Types:**
-- comprehensive: Full detailed report with all sections
-- executive: Brief executive summary for C-suite (3-5 sections max)
-- detailed: Deep analytical report with extensive data (8-12 sections)
-- market_overview: Market-level insights and trends (5-7 sections)
-- competitive_analysis: Focus on competitive landscape (6-8 sections)
+**Report Types and Section Limits (STRICT - DO NOT EXCEED):**
+- comprehensive: Focused detailed report (MAXIMUM 5 sections for faster generation)
+- executive: Brief executive summary for C-suite (MAXIMUM 3 sections)
+- detailed: Analytical report with key data (MAXIMUM 6 sections)
+- market_overview: Market-level insights and trends (MAXIMUM 4 sections)
+- competitive_analysis: Focus on competitive landscape (MAXIMUM 4 sections)
+
+**CRITICAL**: Keep sections to the MINIMUM needed. Combine related topics. Focus on HIGH-IMPACT insights only.
 
 **Output Format (JSON only):**
 {{
@@ -100,6 +102,20 @@ Provide an updated content table in JSON format (same structure as before)."""
                 summary=content_table_dict.get('summary'),
                 sections=sections
             )
+            
+            # Enforce section limits based on report type
+            section_limits = {
+                'comprehensive': 5,
+                'executive': 3,
+                'detailed': 6,
+                'market_overview': 4,
+                'competitive_analysis': 4
+            }
+            max_sections = section_limits.get(report_type, 5)
+            
+            if len(content_table.sections) > max_sections:
+                logger.warning(f"Content table has {len(content_table.sections)} sections, truncating to {max_sections} for {report_type} report")
+                content_table.sections = content_table.sections[:max_sections]
             
             logger.info(f"Content table created with {len(content_table.sections)} sections")
             

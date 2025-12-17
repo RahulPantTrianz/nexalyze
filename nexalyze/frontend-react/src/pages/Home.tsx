@@ -67,7 +67,7 @@ export default function Home() {
             <section className="text-center py-16 animate-fadeIn">
                 <div className="inline-flex items-center gap-2 px-4 py-2 bg-primary-100 text-primary-700 rounded-full text-sm font-medium mb-6">
                     <Sparkles className="w-4 h-4" />
-                    Powered by Google Gemini AI
+                    Powered by Claude Sonnet
                 </div>
 
                 <h1 className="text-5xl md:text-6xl font-bold mb-6">

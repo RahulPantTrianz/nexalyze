@@ -1,6 +1,6 @@
 """
 AI-Powered Competitive Intelligence Service
-Uses Google Gemini API with retry and exponential backoff for maximum availability
+Uses AWS Bedrock (Claude) with retry and exponential backoff for maximum availability
 Focused on startup competition discovery and comprehensive analysis
 """
 import logging

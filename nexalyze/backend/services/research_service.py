@@ -103,10 +103,48 @@ class ResearchService:
                 logger.info(f"Returning cached analysis for {company_name}")
                 return cached
             
+            # Check if we have external data access
+            has_external_access = bool(self.serp_api_key)
+            
             # Get company data from database
             company_data = await self._get_company_data(company_name, data_service)
             
-            # Parallel data fetching
+            # If no external access, return limited analysis based on DB only
+            if not has_external_access:
+                logger.info(f"No SERP API key - performing limited database-only analysis for {company_name}")
+                
+                # Basic overview from DB
+                overview = {
+                    'name': company_data.get('name', company_name),
+                    'description': company_data.get('description') or f"Information for {company_name}",
+                    'industry': company_data.get('industry', 'Unknown'),
+                    'location': company_data.get('location', 'Unknown'),
+                    'website': company_data.get('website', 'N/A'),
+                    'stage': company_data.get('stage', 'Unknown'),
+                    'source': 'database_only'
+                }
+                
+                analysis = {
+                    'company': company_name,
+                    'overview': overview,
+                    'market_position': {'note': 'Market position data requires SERP API key'},
+                    'recent_news': [{'title': 'News data requires SERP API key', 'url': '#', 'date': datetime.now().strftime('%Y-%m-%d')}],
+                    'serp_data': {},
+                    'competitors': [],
+                    'data_sources': ['database']
+                }
+                
+                # Add AI insights if available (Bedrock doesn't need SERP)
+                if self.llm_service:
+                    try:
+                        ai_insights = await self._get_ai_insights(company_name, analysis)
+                        analysis['ai_insights'] = ai_insights
+                    except Exception as e:
+                        logger.warning(f"AI insights failed: {e}")
+                
+                return analysis
+
+            # Parallel data fetching (Only if we have keys)
             tasks = [
                 self._get_company_overview(company_name, company_data),
                 self._analyze_market_position(company_name, company_data),
@@ -135,7 +173,7 @@ class ResearchService:
                 comp_analysis = await self._compare_with_competitors(company_name, competitors, company_data)
                 analysis['competitive_analysis'] = comp_analysis
             
-            # AI-enhanced insights if Bedrock available
+            # AI-enhanced insights
             if self.llm_service:
                 try:
                     ai_insights = await self._get_ai_insights(company_name, analysis)
@@ -167,7 +205,10 @@ class ResearchService:
     async def _get_serp_comprehensive(self, company_name: str) -> Dict[str, Any]:
         """Get comprehensive SERP data for company"""
         if not self.serp_api_key:
+            logger.warning(f"⚠️ SERP API key missing. Skipping external data lookup for '{company_name}'")
             return {}
+        
+        logger.info(f"🔍 SERP API: Fetching external data for '{company_name}'...")
         
         result = {
             'knowledge_graph': {},

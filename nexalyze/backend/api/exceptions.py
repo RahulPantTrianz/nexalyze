@@ -139,7 +139,7 @@ class ConfigurationError(NexalyzeException):
 
 
 class AIServiceError(NexalyzeException):
-    """AI service (Gemini) error"""
+    """AI service (AWS Bedrock) error"""
     
     def __init__(self, message: str = "AI service temporarily unavailable"):
         super().__init__(

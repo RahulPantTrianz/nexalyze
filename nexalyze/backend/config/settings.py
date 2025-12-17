@@ -21,14 +21,15 @@ class Settings(BaseSettings):
     # AI/LLM Configuration
     # ===========================================
     
-    # Gemini API Configuration (Primary AI)
-    gemini_api_key: str = Field(
-        default="",
-        description="Google Gemini API key - REQUIRED for AI features"
-    )
-    gemini_model: str = Field(
-        default="gemini-flash-latest",
-        description="Gemini model to use (gemini-flash-latest, gemini-pro-latest, gemini-1.5-pro, gemini-1.5-flash, gemini-pro)"
+    # AWS Bedrock Configuration (Primary AI)
+    aws_access_key_id: Optional[str] = Field(default=None, description="AWS Access Key ID")
+    aws_secret_access_key: Optional[str] = Field(default=None, description="AWS Secret Access Key")
+    aws_region: str = Field(default="us-east-1", description="AWS Region")
+    aws_profile: str = Field(default="default", description="AWS Profile name")
+    
+    bedrock_model_id: str = Field(
+        default="us.anthropic.claude-sonnet-4-5-20250929-v1:0",
+        description="Bedrock model ID (default: Claude 3.5 Sonnet)"
     )
     
     # AI Model Parameters
@@ -267,7 +268,7 @@ class Settings(BaseSettings):
         
         # Treat as comma-separated string
         origins = [origin.strip() for origin in self.cors_origins.split(',') if origin.strip()]
-        return origins if origins else ["http://localhost:8501", "http://localhost:3000"]
+        return origins if origins else ["http://localhost:8501,http://localhost:3000"]
     
     def get_cors_origins_for_env(self) -> List[str]:
         """Get CORS origins based on environment"""
@@ -304,8 +305,12 @@ def validate_required_settings():
     """Validate that required settings are configured"""
     warnings = []
     
-    if not settings.gemini_api_key:
-        warnings.append("GEMINI_API_KEY not set - AI features will be limited")
+    # Check for AWS credentials (either keys or profile)
+    has_aws_keys = settings.aws_access_key_id and settings.aws_secret_access_key
+    has_aws_profile = bool(settings.aws_profile)
+    
+    if not has_aws_keys and not has_aws_profile:
+        warnings.append("AWS credentials (keys or profile) not configured - AI features may fail")
     
     if settings.is_production:
         if not settings.rate_limit_enabled:

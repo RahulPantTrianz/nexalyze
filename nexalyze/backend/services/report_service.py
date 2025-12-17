@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import logging
 from io import BytesIO
 import json
+import base64
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -236,25 +237,25 @@ class ReportService:
             analysis['company_analysis'] = await self._analyze_companies(companies)
             
             # Technology Analysis
-            analysis['technology_analysis'] = await self._analyze_technology(topic)
+            # analysis['technology_analysis'] = await self._analyze_technology(topic)
             
             # Competitive Landscape
             analysis['competitive_landscape'] = await self._analyze_competitive_landscape(topic, companies)
             
             # Trend Analysis
-            analysis['trend_analysis'] = await self._analyze_trends(topic)
+            # analysis['trend_analysis'] = await self._analyze_trends(topic)
             
             # Financial Analysis
             analysis['financial_analysis'] = await self._analyze_financials(topic, companies)
             
             # Risk Assessment
-            analysis['risk_assessment'] = await self._assess_risks(topic, companies)
+            # analysis['risk_assessment'] = await self._assess_risks(topic, companies)
             
             # Opportunities
-            analysis['opportunities'] = await self._identify_opportunities(topic, companies)
+            # analysis['opportunities'] = await self._identify_opportunities(topic, companies)
             
             # Recommendations
-            analysis['recommendations'] = await self._generate_recommendations(topic, analysis)
+            # analysis['recommendations'] = await self._generate_recommendations(topic, analysis)
             
             return analysis
             
@@ -728,6 +729,31 @@ Provide a competitive matrix table with scores across 10+ dimensions."""
     
     async def _analyze_financials(self, topic: str, companies: List[Dict]) -> Dict[str, Any]:
         """Analyze financial metrics and trends"""
+        # Handle empty companies list to avoid division by zero
+        if not companies:
+            logger.warning(f"No companies found for financial analysis of '{topic}'")
+            return {
+                'funding_overview': {
+                    'total_funding': '$0B',
+                    'average_funding': '$0M',
+                    'funded_companies': 0,
+                    'funding_penetration': '0%',
+                    'note': 'No companies found matching the search criteria'
+                },
+                'funding_by_stage': {},
+                'valuation_trends': {
+                    'unicorns': 0,
+                    'high_value': 0,
+                    'growth_stage': 0
+                },
+                'financial_health_indicators': {
+                    'funding_runway': 'N/A - No data',
+                    'revenue_growth': 'N/A - No data',
+                    'market_efficiency': 'Insufficient data',
+                    'exit_activity': 'No data available'
+                }
+            }
+        
         # Calculate financial metrics
         total_funding = sum([self._parse_funding(c.get('funding', '0')) for c in companies])
         funded_companies = [c for c in companies if c.get('funding') and self._parse_funding(c.get('funding', '0')) > 0]
@@ -740,12 +766,15 @@ Provide a competitive matrix table with scores across 10+ dimensions."""
                 funding_by_stage[stage] = []
             funding_by_stage[stage].append(funding)
         
+        # Safely calculate funding penetration
+        funding_penetration = f"{len(funded_companies)/len(companies)*100:.1f}%" if companies else '0%'
+        
         return {
             'funding_overview': {
                 'total_funding': f"${total_funding/1e9:.1f}B",
                 'average_funding': f"${total_funding/len(funded_companies)/1e6:.1f}M" if funded_companies else "$0M",
                 'funded_companies': len(funded_companies),
-                'funding_penetration': f"{len(funded_companies)/len(companies)*100:.1f}%"
+                'funding_penetration': funding_penetration
             },
             'funding_by_stage': {stage: f"${np.mean(amounts)/1e6:.1f}M" for stage, amounts in funding_by_stage.items() if amounts},
             'valuation_trends': {
@@ -1290,7 +1319,7 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
     <style>
         @page {{
             size: A4;
-            margin: 20mm;
+            margin: 15mm;
         }}
         
         * {{
@@ -1422,8 +1451,12 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
         
         table {{
             width: 100%;
+            max-width: 100%;
+            table-layout: fixed;
             border-collapse: collapse;
             margin: 20px 0;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
         }}
         
         th {{
@@ -1432,11 +1465,16 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             padding: 12px;
             text-align: left;
             font-weight: 600;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
         }}
         
         td {{
             padding: 10px 12px;
             border-bottom: 1px solid #dee2e6;
+            word-wrap: break-word;
+            overflow-wrap: break-word;
+            max-width: 0;
         }}
         
         tr:nth-child(even) {{
@@ -1724,6 +1762,16 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             traceback.print_exc()
             raise
     
+    def _encode_image_to_base64(self, image_path: str) -> str:
+        """Convert image file to base64 data URL for HTML embedding"""
+        try:
+            with open(image_path, 'rb') as image_file:
+                encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+                return f"data:image/png;base64,{encoded_string}"
+        except Exception as e:
+            logger.error(f"Failed to encode image {image_path}: {e}")
+            return ""
+    
     def _build_html_from_sections(
         self, topic: str, report_sections: List[Dict[str, Any]], 
         content_table: Any, analysis_data: Dict[str, Any], 
@@ -1745,7 +1793,7 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
     <style>
         @page {{
             size: A4;
-            margin: 20mm;
+            margin: 15mm;
         }}
         
         * {{
@@ -1848,21 +1896,29 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
         
         table {{
             width: 100%;
+            table-layout: auto;
             border-collapse: collapse;
             margin: 20px 0;
+            overflow-wrap: break-word;
+            word-wrap: break-word;
         }}
         
         th {{
             background: #667eea;
             color: white;
-            padding: 12px;
+            padding: 8px 10px;
             text-align: left;
             font-weight: 600;
+            vertical-align: top;
+            word-break: break-word;
         }}
         
         td {{
-            padding: 10px 12px;
+            padding: 8px 10px;
             border-bottom: 1px solid #dee2e6;
+            vertical-align: top;
+            word-break: break-word;
+            hyphens: auto;
         }}
         
         tr:nth-child(even) {{
@@ -1872,6 +1928,8 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
         .chart-container {{
             margin: 20px 0;
             text-align: center;
+            max-width: 100%;
+            overflow: hidden;
         }}
         
         .chart-container img {{
@@ -1879,6 +1937,8 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             height: auto;
             border-radius: 8px;
             box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            display: block;
+            margin: 0 auto;
         }}
         
         .footer {{
@@ -1959,11 +2019,13 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
 """
             for chart_path in chart_paths:
                 if os.path.exists(chart_path):
-                    # Convert to relative path for HTML
+                    # Encode chart as base64 PNG for direct HTML embedding
                     chart_filename = os.path.basename(chart_path)
-                    html += f"""
+                    chart_data_url = self._encode_image_to_base64(chart_path)
+                    if chart_data_url:
+                        html += f"""
         <div class="chart-container">
-            <img src="{chart_path}" alt="Chart: {chart_filename}" />
+            <img src="{chart_data_url}" alt="Chart: {chart_filename}" />
         </div>
 """
             html += """    </div>
