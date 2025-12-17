@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { Send, Trash2, Bot, User, Sparkles } from 'lucide-react';
-import { sendChatMessage } from '../services/api';
+import { Send, Trash2, Bot, User, Sparkles, Loader2, Wrench } from 'lucide-react';
+import { streamChatMessage, type ChatStreamEvent } from '../services/api';
 import { useAppStore } from '../store';
 import ReactMarkdown from 'react-markdown';
 import clsx from 'clsx';
@@ -17,8 +17,12 @@ export default function Chat() {
     } = useAppStore();
 
     const [input, setInput] = useState('');
+    const [streamingContent, setStreamingContent] = useState('');
+    const [streamingStatus, setStreamingStatus] = useState('');
+    const [currentTools, setCurrentTools] = useState<string[]>([]);
     const messagesEndRef = useRef<HTMLDivElement>(null);
     const inputRef = useRef<HTMLTextAreaElement>(null);
+    const cancelRef = useRef<(() => void) | null>(null);
 
     const scrollToBottom = () => {
         messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -26,7 +30,16 @@ export default function Chat() {
 
     useEffect(() => {
         scrollToBottom();
-    }, [chatMessages]);
+    }, [chatMessages, streamingContent]);
+
+    // Cleanup on unmount
+    useEffect(() => {
+        return () => {
+            if (cancelRef.current) {
+                cancelRef.current();
+            }
+        };
+    }, []);
 
     const handleSubmit = async (e?: React.FormEvent) => {
         e?.preventDefault();
@@ -40,37 +53,99 @@ export default function Chat() {
         };
 
         addChatMessage(userMessage);
+        const query = input.trim();
         setInput('');
         setIsChatLoading(true);
+        setStreamingContent('');
+        setStreamingStatus('');
+        setCurrentTools([]);
 
-        try {
-            const response = await sendChatMessage(input.trim(), chatSessionId || undefined);
-
-            if (response.success && response.data) {
-                if (response.data.session_id) {
-                    setChatSessionId(response.data.session_id);
+        // Use streaming API
+        const { cancel } = streamChatMessage(
+            query,
+            chatSessionId || undefined,
+            (event: ChatStreamEvent) => {
+                switch (event.type) {
+                    case 'start':
+                        setStreamingStatus(event.message || 'Processing...');
+                        break;
+                    case 'status':
+                        setStreamingStatus(event.message || 'Initializing...');
+                        if (event.session_id) {
+                            setChatSessionId(event.session_id);
+                        }
+                        break;
+                    case 'thinking':
+                        setStreamingStatus(event.message || 'Thinking...');
+                        break;
+                    case 'tool_call':
+                        setStreamingStatus(`Calling ${event.tool_name}...`);
+                        if (event.tool_name) {
+                            setCurrentTools(prev => [...prev, event.tool_name!]);
+                        }
+                        break;
+                    case 'tool':
+                        setStreamingStatus(`Executing ${event.tool_name}...`);
+                        if (event.tool_name && !currentTools.includes(event.tool_name)) {
+                            setCurrentTools(prev => [...prev, event.tool_name!]);
+                        }
+                        break;
+                    case 'content':
+                        if (event.message) {
+                            setStreamingContent(prev => prev + event.message + ' ');
+                        }
+                        setStreamingStatus('');
+                        break;
+                    case 'complete':
+                        if (event.session_id) {
+                            setChatSessionId(event.session_id);
+                        }
+                        // Add the final message
+                        const aiMessage = {
+                            id: (Date.now() + 1).toString(),
+                            role: 'assistant' as const,
+                            content: event.message || streamingContent.trim(),
+                            timestamp: new Date(),
+                            tools_used: event.tools_used || currentTools
+                        };
+                        addChatMessage(aiMessage);
+                        setStreamingContent('');
+                        setStreamingStatus('');
+                        setCurrentTools([]);
+                        break;
+                    case 'end':
+                        setIsChatLoading(false);
+                        cancelRef.current = null;
+                        break;
+                    case 'error':
+                        console.error('Chat stream error:', event.message);
+                        addChatMessage({
+                            id: (Date.now() + 1).toString(),
+                            role: 'assistant',
+                            content: `I apologize, but I encountered an error: ${event.message}`,
+                            timestamp: new Date()
+                        });
+                        setStreamingContent('');
+                        setStreamingStatus('');
+                        setCurrentTools([]);
+                        setIsChatLoading(false);
+                        cancelRef.current = null;
+                        break;
                 }
-
-                const aiMessage = {
-                    id: (Date.now() + 1).toString(),
-                    role: 'assistant' as const,
-                    content: response.data.response,
-                    timestamp: new Date(),
-                    tools_used: response.data.tools_used
-                };
-
-                addChatMessage(aiMessage);
             }
-        } catch (error) {
-            console.error('Chat failed:', error);
-            addChatMessage({
-                id: (Date.now() + 1).toString(),
-                role: 'assistant',
-                content: 'I apologize, but I encountered an error. Please try again.',
-                timestamp: new Date()
-            });
-        } finally {
+        );
+
+        cancelRef.current = cancel;
+    };
+
+    const handleCancel = () => {
+        if (cancelRef.current) {
+            cancelRef.current();
+            cancelRef.current = null;
             setIsChatLoading(false);
+            setStreamingContent('');
+            setStreamingStatus('');
+            setCurrentTools([]);
         }
     };
 
@@ -97,7 +172,7 @@ export default function Chat() {
                         <Sparkles className="w-6 h-6 text-primary-500" />
                         AI Chat Assistant
                     </h1>
-                    <p className="text-slate-500 text-sm">Powered by Google Gemini</p>
+                    <p className="text-slate-500 text-sm">Powered by Google Gemini with real-time streaming</p>
                 </div>
                 {chatMessages.length > 0 && (
                     <button
@@ -112,7 +187,7 @@ export default function Chat() {
 
             {/* Messages */}
             <div className="flex-1 overflow-y-auto space-y-4 mb-4">
-                {chatMessages.length === 0 ? (
+                {chatMessages.length === 0 && !isChatLoading ? (
                     <div className="text-center py-12 animate-fadeIn">
                         <div className="w-20 h-20 bg-gradient-to-br from-primary-100 to-secondary-100 rounded-3xl flex items-center justify-center mx-auto mb-6">
                             <Bot className="w-10 h-10 text-primary-500" />
@@ -140,63 +215,86 @@ export default function Chat() {
                         </div>
                     </div>
                 ) : (
-                    chatMessages.map((message) => (
-                        <div
-                            key={message.id}
-                            className={clsx(
-                                'flex gap-3 animate-slideUp',
-                                message.role === 'user' ? 'justify-end' : 'justify-start'
-                            )}
-                        >
-                            {message.role === 'assistant' && (
-                                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-primary-400 to-secondary-500 flex items-center justify-center shrink-0">
-                                    <Bot className="w-4 h-4 text-white" />
-                                </div>
-                            )}
-
+                    <>
+                        {chatMessages.map((message) => (
                             <div
+                                key={message.id}
                                 className={clsx(
-                                    'max-w-[80%] px-4 py-3 rounded-2xl',
-                                    message.role === 'user'
-                                        ? 'chat-message-user'
-                                        : 'chat-message-ai'
+                                    'flex gap-3 animate-slideUp',
+                                    message.role === 'user' ? 'justify-end' : 'justify-start'
                                 )}
                             >
-                                {message.role === 'assistant' ? (
-                                    <div className="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2">
-                                        <ReactMarkdown>{message.content}</ReactMarkdown>
+                                {message.role === 'assistant' && (
+                                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-primary-400 to-secondary-500 flex items-center justify-center shrink-0">
+                                        <Bot className="w-4 h-4 text-white" />
                                     </div>
-                                ) : (
-                                    <p>{message.content}</p>
                                 )}
 
-                                {message.tools_used && message.tools_used.length > 0 && (
-                                    <div className="mt-2 pt-2 border-t border-slate-200 text-xs text-slate-500">
-                                        Used: {message.tools_used.join(', ')}
+                                <div
+                                    className={clsx(
+                                        'max-w-[80%] px-4 py-3 rounded-2xl',
+                                        message.role === 'user'
+                                            ? 'chat-message-user'
+                                            : 'chat-message-ai'
+                                    )}
+                                >
+                                    {message.role === 'assistant' ? (
+                                        <div className="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2">
+                                            <ReactMarkdown>{message.content}</ReactMarkdown>
+                                        </div>
+                                    ) : (
+                                        <p>{message.content}</p>
+                                    )}
+
+                                    {message.tools_used && message.tools_used.length > 0 && (
+                                        <div className="mt-2 pt-2 border-t border-slate-200 text-xs text-slate-500 flex items-center gap-1">
+                                            <Wrench className="w-3 h-3" />
+                                            Used: {message.tools_used.join(', ')}
+                                        </div>
+                                    )}
+                                </div>
+
+                                {message.role === 'user' && (
+                                    <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-600 to-slate-700 flex items-center justify-center shrink-0">
+                                        <User className="w-4 h-4 text-white" />
                                     </div>
                                 )}
                             </div>
-
-                            {message.role === 'user' && (
-                                <div className="w-8 h-8 rounded-full bg-gradient-to-br from-slate-600 to-slate-700 flex items-center justify-center shrink-0">
-                                    <User className="w-4 h-4 text-white" />
-                                </div>
-                            )}
-                        </div>
-                    ))
+                        ))}
+                    </>
                 )}
 
+                {/* Streaming response */}
                 {isChatLoading && (
                     <div className="flex gap-3 animate-fadeIn">
                         <div className="w-8 h-8 rounded-full bg-gradient-to-br from-primary-400 to-secondary-500 flex items-center justify-center">
                             <Bot className="w-4 h-4 text-white" />
                         </div>
-                        <div className="chat-message-ai px-4 py-3">
-                            <div className="flex items-center gap-2">
-                                <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
-                                <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
-                                <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
-                            </div>
+                        <div className="chat-message-ai px-4 py-3 max-w-[80%]">
+                            {streamingStatus && (
+                                <div className="flex items-center gap-2 text-primary-500 mb-2">
+                                    <Loader2 className="w-4 h-4 animate-spin" />
+                                    <span className="text-sm">{streamingStatus}</span>
+                                </div>
+                            )}
+                            {currentTools.length > 0 && !streamingContent && (
+                                <div className="flex items-center gap-2 text-slate-500 text-xs mb-2">
+                                    <Wrench className="w-3 h-3" />
+                                    Tools: {currentTools.join(', ')}
+                                </div>
+                            )}
+                            {streamingContent ? (
+                                <div className="prose prose-sm max-w-none prose-p:my-2 prose-headings:my-2">
+                                    <ReactMarkdown>{streamingContent}</ReactMarkdown>
+                                    <span className="inline-block w-2 h-4 bg-primary-400 animate-pulse ml-1" />
+                                </div>
+                            ) : !streamingStatus && (
+                                <div className="flex items-center gap-2">
+                                    <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
+                                    <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
+                                    <div className="w-2 h-2 bg-primary-400 rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
+                                </div>
+                            )}
                         </div>
                     </div>
                 )}
@@ -217,18 +315,29 @@ export default function Chat() {
                         rows={1}
                         disabled={isChatLoading}
                     />
-                    <button
-                        type="submit"
-                        disabled={!input.trim() || isChatLoading}
-                        className={clsx(
-                            'p-3 rounded-xl transition-all',
-                            input.trim() && !isChatLoading
-                                ? 'bg-gradient-to-r from-primary-500 to-primary-600 text-white shadow-lg hover:shadow-xl'
-                                : 'bg-slate-100 text-slate-400 cursor-not-allowed'
-                        )}
-                    >
-                        <Send className="w-5 h-5" />
-                    </button>
+                    {isChatLoading ? (
+                        <button
+                            type="button"
+                            onClick={handleCancel}
+                            className="p-3 rounded-xl bg-red-500 text-white hover:bg-red-600 transition-all"
+                        >
+                            <span className="sr-only">Cancel</span>
+                            ✕
+                        </button>
+                    ) : (
+                        <button
+                            type="submit"
+                            disabled={!input.trim()}
+                            className={clsx(
+                                'p-3 rounded-xl transition-all',
+                                input.trim()
+                                    ? 'bg-gradient-to-r from-primary-500 to-primary-600 text-white shadow-lg hover:shadow-xl'
+                                    : 'bg-slate-100 text-slate-400 cursor-not-allowed'
+                            )}
+                        >
+                            <Send className="w-5 h-5" />
+                        </button>
+                    )}
                 </div>
             </form>
         </div>

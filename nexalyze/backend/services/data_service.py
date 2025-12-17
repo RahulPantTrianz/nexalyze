@@ -419,22 +419,36 @@ class DataService:
         limit: int,
         filters: Dict[str, Any] = None
     ) -> List[Dict[str, Any]]:
-        """Execute PostgreSQL search query"""
+        """Execute PostgreSQL search query with enhanced name relevance scoring"""
         from database.connections import postgres_conn
         
         # Build filter conditions
         filter_conditions = []
         params = []
         
-        # Add query condition if present
+        # Enhanced name search with relevance scoring
+        # Prioritize: 1. Exact match, 2. Starts with query, 3. Contains query in name, 4. Description/industry match
         if query:
-            filter_conditions.append("(LOWER(name) LIKE %s OR LOWER(description) LIKE %s OR LOWER(industry) LIKE %s)")
-            params.extend([f"%{query.lower()}%", f"%{query.lower()}%", f"%{query.lower()}%"])
+            q = query.lower().strip()
+            filter_conditions.append("""
+                (LOWER(name) = %s OR 
+                 LOWER(name) LIKE %s OR 
+                 LOWER(name) LIKE %s OR 
+                 LOWER(description) LIKE %s OR 
+                 LOWER(industry) LIKE %s)
+            """)
+            params.extend([q, f"{q}%", f"%{q}%", f"%{q}%", f"%{q}%"])
         
         if filters:
             if filters.get("industry"):
-                filter_conditions.append("LOWER(industry) LIKE %s")
-                params.append(f"%{filters['industry'].lower()}%")
+                # Search in both industry column AND tags array (cast to text for LIKE search)
+                filter_conditions.append("""
+                    (LOWER(industry) LIKE %s OR 
+                     LOWER(COALESCE(tags::text, '')) LIKE %s OR
+                     LOWER(description) LIKE %s)
+                """)
+                industry_search = f"%{filters['industry'].lower()}%"
+                params.extend([industry_search, industry_search, industry_search])
             
             if filters.get("location"):
                 filter_conditions.append("LOWER(location) LIKE %s")
@@ -453,10 +467,25 @@ class DataService:
         # Order by relevance if query exists, otherwise by recently updated
         order_clause = ""
         if query:
-            order_clause = "ORDER BY CASE WHEN LOWER(name) LIKE %s THEN 0 ELSE 1 END, founded_year DESC"
-            params.append(f"%{query.lower()}%")
+            q = query.lower().strip()
+            # Enhanced relevance ordering:
+            # 0 = Exact name match
+            # 1 = Name starts with query
+            # 2 = Name contains query
+            # 3 = Only found in description/industry
+            order_clause = """
+                ORDER BY 
+                    CASE 
+                        WHEN LOWER(name) = %s THEN 0
+                        WHEN LOWER(name) LIKE %s THEN 1
+                        WHEN LOWER(name) LIKE %s THEN 2
+                        ELSE 3
+                    END,
+                    founded_year DESC NULLS LAST
+            """
+            params.extend([q, f"{q}%", f"%{q}%"])
         else:
-            order_clause = "ORDER BY created_at DESC, founded_year DESC"
+            order_clause = "ORDER BY created_at DESC NULLS LAST, founded_year DESC NULLS LAST"
             
         sql = f"""
             SELECT 

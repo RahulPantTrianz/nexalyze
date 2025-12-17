@@ -1,6 +1,6 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { FileText, Download, Loader2, CheckCircle, AlertCircle } from 'lucide-react';
-import { generateReport, downloadReport } from '../services/api';
+import { generateReportBackground, getReportTaskStatus, downloadReport } from '../services/api';
 import clsx from 'clsx';
 
 const reportTypes = [
@@ -38,8 +38,19 @@ export default function Reports() {
     const [reportType, setReportType] = useState('comprehensive');
     const [format, setFormat] = useState('pdf');
     const [isGenerating, setIsGenerating] = useState(false);
+    const [pollingStatus, setPollingStatus] = useState<string>('');
     const [error, setError] = useState<string | null>(null);
     const [generatedReports, setGeneratedReports] = useState<GeneratedReport[]>([]);
+    const pollingIntervalRef = useRef<number | null>(null);
+
+    // Cleanup interval on unmount
+    useEffect(() => {
+        return () => {
+            if (pollingIntervalRef.current) {
+                window.clearInterval(pollingIntervalRef.current);
+            }
+        };
+    }, []);
 
     const handleGenerate = async () => {
         if (!topic.trim()) {
@@ -49,32 +60,70 @@ export default function Reports() {
 
         setIsGenerating(true);
         setError(null);
+        setPollingStatus('Initializing report generation...');
 
         try {
-            const response = await generateReport({
+            const response = await generateReportBackground({
                 topic: topic.trim(),
                 report_type: reportType,
                 format,
                 use_langgraph: true
             });
 
-            if (response.success && response.data && response.data.filename) {
-                setGeneratedReports(prev => [{
-                    filename: response.data!.filename,
-                    topic: topic.trim(),
-                    type: reportType,
-                    generatedAt: new Date()
-                }, ...prev]);
-                setTopic('');
+            if (response.success && response.data && response.data.task_id) {
+                pollStatus(response.data.task_id);
             } else {
-                setError('Failed to generate report. Please try again.');
+                setError('Failed to start report generation. Please try again.');
+                setIsGenerating(false);
             }
         } catch (err: any) {
             console.error('Report generation failed:', err);
             setError(err.response?.data?.detail || 'Failed to generate report');
-        } finally {
             setIsGenerating(false);
         }
+    };
+
+    const pollStatus = (taskId: string) => {
+        // Clear any existing interval
+        if (pollingIntervalRef.current) {
+            window.clearInterval(pollingIntervalRef.current);
+        }
+
+        pollingIntervalRef.current = window.setInterval(async () => {
+            try {
+                const response = await getReportTaskStatus(taskId);
+                const task = response.data;
+
+                if (!task) return;
+
+                if (task.status === 'completed') {
+                    if (pollingIntervalRef.current) window.clearInterval(pollingIntervalRef.current);
+                    setIsGenerating(false);
+                    setPollingStatus('');
+
+                    if (task.result?.report_filename) {
+                        setGeneratedReports(prev => [{
+                            filename: task.result!.report_filename,
+                            topic: task.result!.topic || topic,
+                            type: task.result!.report_type || reportType,
+                            generatedAt: new Date()
+                        }, ...prev]);
+                        setTopic('');
+                    }
+                } else if (task.status === 'failed') {
+                    if (pollingIntervalRef.current) window.clearInterval(pollingIntervalRef.current);
+                    setIsGenerating(false);
+                    setPollingStatus('');
+                    setError(task.error || 'Report generation failed');
+                } else {
+                    // Still processing
+                    setPollingStatus(task.message || 'Processing...');
+                }
+            } catch (e) {
+                console.error("Polling error", e);
+                // Don't stop polling on transient errors
+            }
+        }, 10000); // Poll every 10 seconds
     };
 
     return (
@@ -180,7 +229,7 @@ export default function Reports() {
                     {isGenerating ? (
                         <>
                             <Loader2 className="w-5 h-5 animate-spin" />
-                            Generating Report...
+                            {pollingStatus || 'Generating Report...'}
                         </>
                     ) : (
                         <>
@@ -192,7 +241,7 @@ export default function Reports() {
 
                 {isGenerating && (
                     <p className="text-sm text-slate-500 text-center mt-4">
-                        This may take 1-2 minutes. Our AI is researching and compiling your report.
+                        This may take a few minutes. You can wait here or check back later.
                     </p>
                 )}
             </div>

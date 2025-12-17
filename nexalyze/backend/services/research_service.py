@@ -11,7 +11,8 @@ import random
 import ssl
 from datetime import datetime, timedelta
 from config.settings import settings
-from services.gemini_service import get_gemini_service
+from config.settings import settings
+from services.bedrock_service import get_bedrock_service
 import hashlib
 import re
 import json
@@ -23,21 +24,21 @@ class ResearchService:
     """
     Enhanced Research Service combining:
     - Advanced SERP API features (Knowledge Graph, News, Related Searches)
-    - Gemini AI for intelligent analysis
+    - Bedrock AI (Claude Sonnet) for intelligent analysis
     - Multiple data source aggregation
     - Caching for performance
     """
     
     def __init__(self):
         self.serp_api_key = settings.serp_api_key
-        self.gemini_service = None
+        self.llm_service = None
         self.cache: Dict[str, Dict] = {}
         self.cache_ttl = 1800  # 30 minutes
         
         try:
-            self.gemini_service = get_gemini_service()
+            self.llm_service = get_bedrock_service()
         except Exception as e:
-            logger.warning(f"Could not initialize Gemini service: {e}")
+            logger.warning(f"Could not initialize Bedrock service: {e}")
     
     def _get_cache_key(self, prefix: str, query: str) -> str:
         """Generate cache key"""
@@ -134,8 +135,8 @@ class ResearchService:
                 comp_analysis = await self._compare_with_competitors(company_name, competitors, company_data)
                 analysis['competitive_analysis'] = comp_analysis
             
-            # AI-enhanced insights if Gemini available
-            if self.gemini_service:
+            # AI-enhanced insights if Bedrock available
+            if self.llm_service:
                 try:
                     ai_insights = await self._get_ai_insights(company_name, analysis)
                     analysis['ai_insights'] = ai_insights
@@ -241,7 +242,7 @@ class ResearchService:
             overview = await self._generate_company_overview_from_serp(company_name)
         
         # Enrich with AI if available
-        if self.gemini_service and overview.get('description') == f"{company_name} is an innovative company":
+        if self.llm_service and overview.get('description') == f"{company_name} is an innovative company":
             try:
                 ai_desc = await self._get_ai_company_description(company_name)
                 if ai_desc:
@@ -288,18 +289,18 @@ class ResearchService:
     
     async def _get_ai_company_description(self, company_name: str) -> str:
         """Get AI-generated company description"""
-        if not self.gemini_service:
+        if not self.llm_service:
             return None
         
         prompt = f"""Write a concise 2-3 sentence professional description for the company "{company_name}".
 Focus on what the company does, its main products/services, and value proposition.
 Return only the description, no other text."""
 
-        return await self.gemini_service.generate_content(prompt, temperature=0.3)
+        return await self.llm_service.generate_text(prompt, temperature=0.3)
     
     async def _get_ai_insights(self, company_name: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Get AI-powered insights based on collected data"""
-        if not self.gemini_service:
+        if not self.llm_service:
             return {}
         
         try:
@@ -330,7 +331,7 @@ Return as JSON:
     "key_risk": "..."
 }}"""
 
-            response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+            response = await self.llm_service.generate_text(prompt, temperature=0.3)
             
             json_match = re.search(r'\{[\s\S]*\}', response)
             if json_match:
@@ -570,7 +571,7 @@ Return as JSON:
         stage = company_data.get('stage', 'Growth') if company_data else 'Growth'
         
         # Use AI if available
-        if self.gemini_service:
+        if self.llm_service:
             try:
                 prompt = f"""Generate a SWOT analysis for {company_name} in the {industry} industry.
 Competitors: {', '.join(competitors[:3])}
@@ -584,7 +585,7 @@ Return JSON:
     "competitive_advantages": ["adv1", "adv2", "adv3"]
 }}"""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+                response = await self.llm_service.generate_text(prompt, temperature=0.3)
                 
                 json_match = re.search(r'\{[\s\S]*\}', response)
                 if json_match:

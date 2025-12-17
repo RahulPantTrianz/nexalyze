@@ -2,8 +2,10 @@
 fastapi
 uvicorn[standard]
 
-# AI and ML - Gemini (Primary) + CrewAI + LangGraph
-google-generativeai>=0.3.0  # Google Gemini API
+# AI and ML - AWS Bedrock (Primary) + Gemini (Fallback) + CrewAI + LangGraph
+langchain-aws>=0.1.0  # AWS Bedrock integration
+boto3>=1.28.0  # AWS SDK
+google-generativeai>=0.3.0  # Google Gemini API (fallback)
 crewai[google-genai]>=0.70.0  # CrewAI with Google Gen AI native provider
 langchain>=0.2.0
 langgraph>=0.2.0  # LangGraph for agent workflows

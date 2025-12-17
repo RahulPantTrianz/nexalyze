@@ -12,16 +12,13 @@ from agents.langgraph_agent.utils import (
     estimate_context_usage,
     count_tokens_accurate
 )
-from services.gemini_service import get_gemini_service
+
 from config.settings import settings
 import logging
 import asyncio
 import re
 
 logger = logging.getLogger(__name__)
-
-# Get Gemini service for LLM
-gemini_service = get_gemini_service()
 
 # System prompt for the conversational agent
 SYSTEM_PROMPT = """You are Nexalyze, an AI-powered assistant specialized in startup research, competitive intelligence, and market analysis.
@@ -51,6 +48,11 @@ Your capabilities include:
 Remember: You have access to a database of thousands of companies. Use tools to access this data when needed."""
 
 
+from services.bedrock_service import get_bedrock_service
+
+# Get Bedrock service for LLM
+bedrock_service = get_bedrock_service()
+
 async def agent_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any]:
     """
     Main agent node that processes user queries and decides on tool usage.
@@ -70,101 +72,29 @@ async def agent_node(state: AgentState, config: RunnableConfig) -> Dict[str, Any
     
     logger.info(f"Message counts - Human: {human_message_count}, Tool: {tool_message_count}, Total: {len(messages)}")
     
-    # Estimate context usage
-    context_stats = estimate_context_usage(messages, SYSTEM_PROMPT)
-    logger.info(f"Context usage: {context_stats['total_input_tokens']:,} / {context_stats['max_input_tokens']:,} tokens "
-                f"({context_stats['usage_percentage']:.1f}%)")
+    # Prepare system message
+    system_message = SystemMessage(content=SYSTEM_PROMPT)
     
-    # Prepare messages for LLM
-    current_messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        *messages
-    ]
-    
-    # Get all available tools
+    # Get tools and bind them to the model
     tools = get_all_tools()
-    logger.info(f"Agent has access to {len(tools)} tools: {[tool.name for tool in tools]}")
+    llm = bedrock_service.get_chat_model()
+    llm_with_tools = llm.bind_tools(tools)
     
-    # Prepare prompt with tool descriptions
-    tools_description = "\n\nAvailable tools:\n"
-    for tool in tools:
-        tools_description += f"- {tool.name}: {tool.description}\n"
+    # Prepare messages for LLM (prepend system message)
+    # Filter out system messages from history to avoid duplication if one exists
+    history_messages = [m for m in messages if not isinstance(m, SystemMessage)]
+    # Ensure the first message is the system message
+    final_messages = [system_message] + history_messages
     
-    # Build conversation history for Gemini
-    conversation_text = ""
-    for msg in messages[-10:]:  # Last 10 messages for context
-        if hasattr(msg, 'type'):
-            if msg.type == 'human':
-                conversation_text += f"User: {msg.content}\n\n"
-            elif msg.type == 'ai':
-                conversation_text += f"Assistant: {msg.content}\n\n"
-            elif msg.type == 'tool':
-                conversation_text += f"Tool Result ({getattr(msg, 'name', 'tool')}): {msg.content[:500]}...\n\n"
-    
-    # Create enhanced prompt with tools
-    enhanced_prompt = f"""{SYSTEM_PROMPT}
-
-{tools_description}
-
-Conversation History:
-{conversation_text}
-
-Current User Query: {messages[-1].content if messages else 'No query'}
-
-Instructions:
-1. If you need to use a tool, respond with: TOOL_CALL: tool_name(arg1="value1", arg2="value2")
-2. You can call multiple tools by separating with newlines
-3. If no tool is needed, provide a direct answer
-4. Format tool calls exactly as shown above
-
-Response:"""
-    
-    # Use Gemini service for LLM
     try:
-        response_text = await gemini_service.chat(
-            message=enhanced_prompt,
-            session_id=session_id
-        )
-        
-        # Parse response for tool calls
-        tool_calls = []
-        content = response_text
-        
-        # Check if response contains tool calls
-        import re
-        tool_call_pattern = r'TOOL_CALL:\s*(\w+)\s*\(([^)]+)\)'
-        matches = re.findall(tool_call_pattern, response_text)
-        
-        if matches:
-            # Extract tool calls
-            for tool_name, args_str in matches:
-                # Parse arguments (simple key=value parsing)
-                args = {}
-                arg_matches = re.findall(r'(\w+)="([^"]+)"', args_str)
-                for key, value in arg_matches:
-                    args[key] = value
-                
-                tool_calls.append({
-                    'name': tool_name,
-                    'args': args,
-                    'id': f"{tool_name}_{len(tool_calls)}"
-                })
-            
-            # Remove tool call markers from content
-            content = re.sub(tool_call_pattern, '', response_text).strip()
-        
-        # Create AI message
-        ai_message = AIMessage(content=content)
-        if tool_calls:
-            # Store tool calls in a way LangGraph can use
-            ai_message.tool_calls = tool_calls
-            logger.info(f"Agent requested {len(tool_calls)} tool call(s)")
+        # Invoke LLM
+        response = await llm_with_tools.ainvoke(final_messages)
         
         # Increment iteration count
         new_iteration_count = iteration_count + 1
         
         return {
-            "messages": [ai_message],
+            "messages": [response],
             "iteration_count": new_iteration_count
         }
         
@@ -179,6 +109,7 @@ Response:"""
             "messages": [error_message],
             "iteration_count": iteration_count + 1
         }
+
 
 
 async def tools_node(state: AgentState) -> Dict[str, Any]:

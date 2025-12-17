@@ -57,12 +57,8 @@ sns.set_palette("husl")
 
 class ReportService:
     def __init__(self):
-        # Lazy import to avoid circular dependency
-        from agents.crew_manager import CrewManager
-        
         self.data_service = DataService()
         self.research_service = ResearchService()
-        self.crew_manager = CrewManager()  # For LLM-powered insights
         self.reports_dir = "reports"
         self.charts_dir = "charts"
         
@@ -499,11 +495,15 @@ Provide a competitive matrix table with scores across 10+ dimensions."""
             # Use detailed prompt based on report type
             prompt = self._get_report_prompt_by_type(report_type, topic, companies)
 
-            llm_response = await self.crew_manager.handle_conversation(prompt, "report_gen")
+            # Use Bedrock via ResearchService
+            if self.research_service.llm_service:
+                llm_response = await self.research_service.llm_service.generate_text(prompt, temperature=0.7)
+            else:
+                llm_response = "AI service unavailable for summary generation."
             
             # Parse LLM response and structure it
             return {
-                'overview': llm_response if isinstance(llm_response, str) else f"Analysis of {topic} sector with {len(companies)} companies reveals significant opportunities.",
+                'overview': llm_response if isinstance(llm_response, str) else f"Analysis of {topic} sector with {len(companies)} companies.",
                 'key_findings': [
                     f"Market presence: {len(companies)} active companies across {len(industries)} industries",
                     f"Geographic distribution: {len(locations)} locations with global reach",

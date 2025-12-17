@@ -1,7 +1,7 @@
 import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Search as SearchIcon, Filter, Building2, MapPin, Calendar, DollarSign, Users, ExternalLink } from 'lucide-react';
-import { searchCompanies } from '../services/api';
+import { Search as SearchIcon, Filter, Building2, MapPin, Calendar, DollarSign, Users, ExternalLink, Loader2 } from 'lucide-react';
+import { searchCompanies, type CompanySearchFilters } from '../services/api';
 import { useAppStore } from '../store';
 import type { Company } from '../types';
 import clsx from 'clsx';
@@ -17,22 +17,23 @@ export default function Search() {
     const handleSearch = useCallback(async () => {
         setIsSearching(true);
         try {
-            // Pass empty string if query is empty to get all companies
             const query = searchQuery.trim();
-            const response = await searchCompanies(query, 50);
+            const filters: CompanySearchFilters = {};
+
+            if (selectedIndustry !== 'All') {
+                filters.industry = selectedIndustry;
+            }
+
+            const response = await searchCompanies(query, 100, filters);
 
             if (response.success && response.data) {
-                let filtered = response.data;
-                if (selectedIndustry !== 'All') {
-                    filtered = filtered.filter(c =>
-                        c.industry?.toLowerCase().includes(selectedIndustry.toLowerCase()) ||
-                        c.tags?.some(t => t.toLowerCase().includes(selectedIndustry.toLowerCase()))
-                    );
-                }
-                setSearchResults(filtered);
+                setSearchResults(response.data);
+            } else {
+                setSearchResults([]);
             }
         } catch (error) {
             console.error('Search failed:', error);
+            setSearchResults([]);
         } finally {
             setIsSearching(false);
         }
@@ -42,6 +43,13 @@ export default function Search() {
     useEffect(() => {
         handleSearch();
     }, []); // Run once on mount
+
+    // Search when filter changes
+    useEffect(() => {
+        if (selectedIndustry) {
+            handleSearch();
+        }
+    }, [selectedIndustry]);
 
     const handleKeyDown = (e: React.KeyboardEvent) => {
         if (e.key === 'Enter') handleSearch();
@@ -55,7 +63,7 @@ export default function Search() {
                     Discover <span className="gradient-text">Startups</span>
                 </h1>
                 <p className="text-slate-600 max-w-xl mx-auto">
-                    Search our database of 3,500+ companies from Y Combinator, Product Hunt, and more.
+                    Search our database of 5,000+ companies from Y Combinator, Product Hunt, and more.
                 </p>
             </div>
 
@@ -90,7 +98,7 @@ export default function Search() {
                     >
                         {isSearching ? (
                             <span className="flex items-center gap-2">
-                                <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                                <Loader2 className="w-5 h-5 animate-spin" />
                                 Searching...
                             </span>
                         ) : (
@@ -125,12 +133,28 @@ export default function Search() {
                 )}
             </div>
 
-            {/* Results */}
-            {searchResults.length > 0 && (
-                <div className="mb-4 text-slate-600">
-                    Found <span className="font-semibold text-slate-800">{searchResults.length}</span> companies
+            {/* Results Header */}
+            <div className="flex items-center justify-between mb-4">
+                <div className="text-slate-600">
+                    {searchResults.length > 0 ? (
+                        <>
+                            Found <span className="font-semibold text-slate-800">{searchResults.length}</span> companies
+                            {selectedIndustry !== 'All' && (
+                                <span className="text-primary-500 ml-2">
+                                    in {selectedIndustry}
+                                </span>
+                            )}
+                        </>
+                    ) : isSearching ? (
+                        <span className="flex items-center gap-2">
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                            Searching...
+                        </span>
+                    ) : (
+                        <span>Ready to search</span>
+                    )}
                 </div>
-            )}
+            </div>
 
             <div className="grid gap-4">
                 {searchResults.map((company, index) => (
@@ -138,17 +162,26 @@ export default function Search() {
                         key={company.id || index}
                         company={company}
                         onClick={() => navigate(`/company/${company.id}`)}
-                        delay={index * 50}
+                        delay={index < 20 ? index * 30 : 0}
                     />
                 ))}
             </div>
 
             {/* Empty state */}
-            {!isSearching && searchResults.length === 0 && searchQuery && (
+            {!isSearching && searchResults.length === 0 && (
                 <div className="text-center py-12 text-slate-500">
                     <Building2 className="w-16 h-16 mx-auto mb-4 text-slate-300" />
-                    <p className="text-lg">No companies found for "{searchQuery}"</p>
-                    <p className="text-sm mt-2">Try adjusting your search terms or filters</p>
+                    {searchQuery ? (
+                        <>
+                            <p className="text-lg">No companies found for "{searchQuery}"</p>
+                            <p className="text-sm mt-2">Try adjusting your search terms or filters</p>
+                        </>
+                    ) : (
+                        <>
+                            <p className="text-lg">No companies in database</p>
+                            <p className="text-sm mt-2">Sync data from the home page to get started</p>
+                        </>
+                    )}
                 </div>
             )}
         </div>

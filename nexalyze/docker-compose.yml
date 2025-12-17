@@ -155,6 +155,7 @@ services:
       - backend_reports:/app/reports
       - backend_logs:/app/logs
       - backend_cache:/app/cache
+      - ${USERPROFILE}/.aws:/home/nexalyze/.aws:ro
     networks:
       - nexalyze_network
     healthcheck:

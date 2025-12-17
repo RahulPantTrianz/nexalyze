@@ -18,8 +18,9 @@ research_service = ResearchService()
 
 class CompanySearchInput(BaseModel):
     """Input for company search tool"""
-    query: str = Field(..., description="Search query to find companies (name, industry, description, etc.)")
+    query: str = Field(default="", description="Search query to find companies (name, industry, description, etc.). Can be empty to search all.")
     limit: int = Field(default=10, description="Maximum number of companies to return")
+    industry: Optional[str] = Field(default=None, description="Filter by industry (e.g., AI, Healthcare, FinTech)")
 
 
 class CompanyAnalysisInput(BaseModel):
@@ -39,7 +40,7 @@ class ReportGenerationInput(BaseModel):
 
 
 @tool("search_companies", args_schema=CompanySearchInput)
-async def search_companies_tool(query: str, limit: int = 10) -> str:
+async def search_companies_tool(query: str = "", limit: int = 10, industry: Optional[str] = None) -> str:
     """
     Search for companies in the database by name, industry, description, or other attributes.
     
@@ -52,18 +53,33 @@ async def search_companies_tool(query: str, limit: int = 10) -> str:
     Returns a formatted list of companies with their key information.
     """
     try:
-        logger.info(f"Searching companies with query: {query}, limit: {limit}")
-        companies = await data_service.search_companies(query, limit)
+        # Build filters dict
+        filters = {}
+        if industry:
+            filters['industry'] = industry
+        
+        logger.info(f"Searching companies with query: {query}, limit: {limit}, industry: {industry}")
+        companies = await data_service.search_companies(query, limit, filters if filters else None)
         
         if not companies:
-            return f"No companies found matching '{query}'. Try a different search term."
+            search_desc = f"'{query}'" if query else "all companies"
+            if industry:
+                search_desc += f" in {industry}"
+            return f"No companies found matching {search_desc}. Try a different search term or industry."
         
-        result = f"Found {len(companies)} companies matching '{query}':\n\n"
+        result_header = f"Found {len(companies)} companies"
+        if query:
+            result_header += f" matching '{query}'"
+        if industry:
+            result_header += f" in {industry}"
+        result = f"{result_header}:\n\n"
+        
         for idx, company in enumerate(companies, 1):
             result += f"{idx}. **{company.get('name', 'Unknown')}**\n"
             result += f"   - Industry: {company.get('industry', 'N/A')}\n"
             result += f"   - Location: {company.get('location', 'N/A')}\n"
-            result += f"   - Description: {company.get('description', 'N/A')[:100]}...\n"
+            desc = company.get('description', 'N/A') or 'N/A'
+            result += f"   - Description: {desc[:100]}...\n"
             if company.get('yc_batch'):
                 result += f"   - YC Batch: {company.get('yc_batch')}\n"
             result += "\n"

@@ -4,14 +4,15 @@ Nodes for Report Generation Agent
 from typing import Dict, Any
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from agents.report_agent.state import ReportAgentState, ContentTable, ContentTableSection
-from services.gemini_service import get_gemini_service
+from services.bedrock_service import get_bedrock_service
 import logging
 import json
 import re
+import asyncio
 
 logger = logging.getLogger(__name__)
 
-gemini_service = get_gemini_service()
+bedrock_service = get_bedrock_service()
 
 CONTENT_TABLE_PROMPT = """You are an expert report content planner. Your task is to create a structured content table for a {report_type} report on the topic: {topic}.
 
@@ -83,7 +84,7 @@ Provide an updated content table in JSON format (same structure as before)."""
         prompt = CONTENT_TABLE_PROMPT.format(topic=topic, report_type=report_type)
     
     try:
-        response = await gemini_service.generate_content(prompt, temperature=0.3)
+        response = await bedrock_service.generate_text(prompt, temperature=0.3)
         
         # Extract JSON from response
         json_match = re.search(r'\{[\s\S]*\}', response)
@@ -147,53 +148,56 @@ async def node_generate_report_sections(state: ReportAgentState) -> Dict[str, An
     # Fetch companies related to topic
     companies = await data_service.search_companies(topic, 20)
     
-    # Process each section with data-driven content
-    for section in content_table.sections:
-        try:
-            logger.info(f"Processing section: {section.heading}")
-            
-            # Prepare data context based on section heading
-            data_context = ""
-            if "executive" in section.heading.lower() or "summary" in section.heading.lower():
-                data_context = f"""
+    # Create a semaphore to limit concurrency to 5
+    sem = asyncio.Semaphore(5)
+
+    async def _process_section(section):
+        async with sem:
+            try:
+                logger.info(f"Processing section: {section.heading}")
+                
+                # Prepare data context based on section heading
+                data_context = ""
+                if "executive" in section.heading.lower() or "summary" in section.heading.lower():
+                    data_context = f"""
 DATA CONTEXT:
 - Companies analyzed: {len(companies)}
 - Top companies: {', '.join([c.get('name', 'Unknown') for c in companies[:5]])}
 - Industries: {', '.join(list(set(c.get('industry', 'Unknown') for c in companies))[:5])}
 """
-            elif "market" in section.heading.lower():
-                industries = {}
-                locations = {}
-                for company in companies:
-                    industry = company.get('industry', 'Unknown')
-                    industries[industry] = industries.get(industry, 0) + 1
-                    location = company.get('location', 'Unknown')
-                    locations[location] = locations.get(location, 0) + 1
-                
-                data_context = f"""
+                elif "market" in section.heading.lower():
+                    industries = {}
+                    locations = {}
+                    for company in companies:
+                        industry = company.get('industry', 'Unknown')
+                        industries[industry] = industries.get(industry, 0) + 1
+                        location = company.get('location', 'Unknown')
+                        locations[location] = locations.get(location, 0) + 1
+                    
+                    data_context = f"""
 DATA CONTEXT:
 - Total companies: {len(companies)}
 - Industry segments: {len(industries)}
-- Top industries: {', '.join(sorted(industries.items(), key=lambda x: x[1], reverse=True)[:3])}
-- Geographic distribution: {', '.join(sorted(locations.items(), key=lambda x: x[1], reverse=True)[:3])}
+- Top industries: {', '.join([k for k, v in sorted(industries.items(), key=lambda x: x[1], reverse=True)[:3]])}
+- Geographic distribution: {', '.join([k for k, v in sorted(locations.items(), key=lambda x: x[1], reverse=True)[:3]])}
 """
-            elif "company" in section.heading.lower() or "competitive" in section.heading.lower():
-                top_companies = sorted(companies, key=lambda x: len(x.get('name', '')), reverse=True)[:10]
-                data_context = f"""
+                elif "company" in section.heading.lower() or "competitive" in section.heading.lower():
+                    top_companies = sorted(companies, key=lambda x: len(x.get('name', '')), reverse=True)[:10]
+                    data_context = f"""
 DATA CONTEXT:
 - Top companies: {', '.join([c.get('name', 'Unknown') for c in top_companies])}
 - Company details available for analysis
 """
-            else:
-                data_context = f"""
+                else:
+                    data_context = f"""
 DATA CONTEXT:
 - Topic: {topic}
 - Companies analyzed: {len(companies)}
 - Report type: {report_type}
 """
-            
-            # Generate section content with data context
-            section_prompt = f"""Generate comprehensive, data-driven content for the following report section:
+                
+                # Generate section content with data context
+                section_prompt = f"""Generate comprehensive, data-driven content for the following report section:
 
 **Section Heading:** {section.heading}
 **Focus Elements:** {', '.join(section.focus_elements) if section.focus_elements else 'General analysis'}
@@ -225,43 +229,48 @@ Return the content wrapped in <section> tags with proper HTML structure. Example
 
 Generate the content now:"""
 
-            section_content = await gemini_service.generate_content(section_prompt, temperature=0.3)
-            
-            # Extract HTML content
-            html_match = re.search(r'<section>(.*?)</section>', section_content, re.DOTALL)
-            if html_match:
-                html_content = html_match.group(1).strip()
-            else:
-                # Try to find any HTML content
-                if '<h2>' in section_content or '<h3>' in section_content:
-                    html_content = section_content
+                section_content = await bedrock_service.generate_text(section_prompt, temperature=0.3)
+                
+                # Extract HTML content
+                html_match = re.search(r'<section>(.*?)</section>', section_content, re.DOTALL)
+                if html_match:
+                    html_content = html_match.group(1).strip()
                 else:
-                    # Fallback: wrap in proper HTML structure
-                    html_content = f"<div><h2>{section.heading}</h2><p>{section_content}</p></div>"
-            
-            report_sections.append({
-                "heading": section.heading,
-                "content": html_content,
-                "sources": section.sources,
-                "focus_elements": section.focus_elements
-            })
-            
-        except Exception as e:
-            logger.error(f"Error generating section {section.heading}: {e}")
-            import traceback
-            traceback.print_exc()
-            report_sections.append({
-                "heading": section.heading,
-                "content": f"<div><h2>{section.heading}</h2><p>Error generating this section: {str(e)}</p></div>",
-                "sources": section.sources
-            })
+                    # Try to find any HTML content
+                    if '<h2>' in section_content or '<h3>' in section_content:
+                        html_content = section_content
+                    else:
+                        # Fallback: wrap in proper HTML structure
+                        html_content = f"<div><h2>{section.heading}</h2><p>{section_content}</p></div>"
+                
+                return {
+                    "heading": section.heading,
+                    "content": html_content,
+                    "sources": section.sources,
+                    "focus_elements": section.focus_elements
+                }
+                
+            except Exception as e:
+                logger.error(f"Error generating section {section.heading}: {e}")
+                import traceback
+                traceback.print_exc()
+                return {
+                    "heading": section.heading,
+                    "content": f"<div><h2>{section.heading}</h2><p>Error generating this section: {str(e)}</p></div>",
+                    "sources": section.sources,
+                    "focus_elements": section.focus_elements
+                }
+
+    # Process all sections in parallel with rate limiting
+    tasks = [_process_section(section) for section in content_table.sections]
+    results = await asyncio.gather(*tasks)
     
-    logger.info(f"Generated {len(report_sections)} report sections")
+    logger.info(f"Generated {len(results)} report sections")
     
     return {
-        "report_sections": report_sections,
+        "report_sections": list(results),
         "status": "completed",
-        "messages": [AIMessage(content=f"Report generation completed with {len(report_sections)} sections.")]
+        "messages": [AIMessage(content=f"Report generation completed with {len(results)} sections.")]
     }
 
 

@@ -9,14 +9,14 @@ import re
 import asyncio
 from typing import Dict, List, Any, Optional
 from config.settings import settings
-from services.gemini_service import get_gemini_service, GeminiService
+from services.bedrock_service import get_bedrock_service, BedrockService
 
 logger = logging.getLogger(__name__)
 
 
 class CompetitiveIntelligenceService:
     """
-    AI-powered competitive intelligence using Gemini
+    AI-powered competitive intelligence using AWS Bedrock (Claude)
     Features:
     - Intelligent competitor discovery
     - Comprehensive competitive analysis
@@ -25,17 +25,17 @@ class CompetitiveIntelligenceService:
     """
     
     def __init__(self):
-        self.gemini_service: Optional[GeminiService] = None
+        self.bedrock_service: Optional[BedrockService] = None
         self._init_service()
     
     def _init_service(self):
-        """Initialize the Gemini service"""
+        """Initialize the Bedrock service"""
         try:
-            self.gemini_service = get_gemini_service()
-            logger.info("Competitive Intelligence Service initialized with Gemini AI")
+            self.bedrock_service = get_bedrock_service()
+            logger.info("Competitive Intelligence Service initialized with AWS Bedrock")
         except Exception as e:
-            logger.error(f"Failed to initialize Gemini service: {e}")
-            self.gemini_service = None
+            logger.error(f"Failed to initialize Bedrock service: {e}")
+            self.bedrock_service = None
     
     async def discover_competitors(self, company_name: str, industry: str = None) -> List[str]:
         """
@@ -48,7 +48,7 @@ class CompetitiveIntelligenceService:
         Returns:
             List of competitor names
         """
-        if self.gemini_service:
+        if self.bedrock_service:
             try:
                 prompt = f"""You are a competitive intelligence analyst specializing in the startup and technology ecosystem.
 
@@ -71,7 +71,7 @@ Return ONLY a JSON array of competitor company names:
 
 Do not include any other text, explanations, or formatting."""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+                response = await self.bedrock_service.generate_text(prompt, temperature=0.3)
                 
                 # Parse JSON response
                 json_match = re.search(r'\[[\s\S]*?\]', response)
@@ -185,7 +185,7 @@ Do not include any other text, explanations, or formatting."""
         industry = company_data.get('industry', 'Technology') if company_data else 'Technology'
         stage = company_data.get('stage', 'Growth Stage') if company_data else 'Growth Stage'
         
-        if self.gemini_service:
+        if self.bedrock_service:
             try:
                 prompt = f"""You are a senior competitive intelligence analyst. Provide comprehensive analysis for the following company.
 
@@ -219,7 +219,7 @@ Return as JSON:
 
 Be specific and actionable. Use real market insights."""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+                response = await self.bedrock_service.generate_text(prompt, temperature=0.3)
                 
                 # Parse JSON response
                 json_match = re.search(r'\{[\s\S]*\}', response)
@@ -306,7 +306,7 @@ Be specific and actionable. Use real market insights."""
             "competitors": {}
         }
         
-        if self.gemini_service:
+        if self.bedrock_service:
             try:
                 prompt = f"""Score {company_name} and its competitors on these dimensions (1-10 scale):
 Dimensions: {', '.join(dimensions)}
@@ -322,7 +322,7 @@ Return JSON with scores for each:
 
 Be realistic and differentiated in scoring."""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.4)
+                response = await self.bedrock_service.generate_text(prompt, temperature=0.4)
                 
                 json_match = re.search(r'\{[\s\S]*\}', response)
                 if json_match:
@@ -373,7 +373,7 @@ Be realistic and differentiated in scoring."""
         Returns:
             Market gap analysis with opportunities
         """
-        if self.gemini_service:
+        if self.bedrock_service:
             try:
                 prompt = f"""Analyze market gaps for {company_name} in the {industry} industry.
 
@@ -398,7 +398,7 @@ Return JSON:
 
 Be specific and actionable."""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.4)
+                response = await self.bedrock_service.generate_text(prompt, temperature=0.4)
                 
                 json_match = re.search(r'\{[\s\S]*\}', response)
                 if json_match:
@@ -459,7 +459,7 @@ Be specific and actionable."""
         Returns:
             SWOT analysis dictionary
         """
-        if self.gemini_service:
+        if self.bedrock_service:
             try:
                 industry = company_data.get('industry', 'Technology') if company_data else 'Technology'
                 description = company_data.get('description', '') if company_data else ''
@@ -480,7 +480,7 @@ Return JSON:
     "threats": ["threat 1", "threat 2", "threat 3", "threat 4"]
 }}"""
 
-                response = await self.gemini_service.generate_content(prompt, temperature=0.3)
+                response = await self.bedrock_service.generate_text(prompt, temperature=0.3)
                 
                 json_match = re.search(r'\{[\s\S]*\}', response)
                 if json_match:
