@@ -172,7 +172,7 @@ export default function Chat() {
                         <Sparkles className="w-6 h-6 text-primary-500" />
                         AI Chat Assistant
                     </h1>
-                    <p className="text-slate-500 text-sm">Powered by Google Gemini with real-time streaming</p>
+                    <p className="text-slate-500 text-sm">Powered by Claude Sonnet with real-time streaming</p>
                 </div>
                 {chatMessages.length > 0 && (
                     <button

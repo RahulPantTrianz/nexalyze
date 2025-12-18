@@ -229,18 +229,41 @@ DATA CONTEXT:
 4. Make it professional, well-structured, and suitable for a {report_type} report
 5. Use metrics, percentages, and concrete data points
 6. Keep content focused and concise but comprehensive
+7. For visualizations, use <graph> tags containing Python matplotlib code
+
+**Visualization Instructions:**
+When appropriate, include a visualization using the <graph> tag with complete Python code:
+- Import matplotlib.pyplot as plt at the start
+- Use plt.figure() or plt.subplots() to create the figure
+- Include proper title, labels, and styling
+- The code will be executed and converted to an embedded image
+
+Example <graph> tag:
+<graph>
+import matplotlib.pyplot as plt
+import numpy as np
+
+categories = ['A', 'B', 'C']
+values = [30, 50, 20]
+
+fig, ax = plt.subplots(figsize=(8, 5))
+ax.bar(categories, values, color=['#667eea', '#764ba2', '#f093fb'])
+ax.set_title('Sample Distribution')
+ax.set_ylabel('Percentage')
+plt.tight_layout()
+</graph>
 
 **Output Format:**
-Return the content wrapped in <section> tags with proper HTML structure. Example:
+Return the content wrapped in <section> tags with proper HTML structure:
 <section>
     <h2>{section.heading}</h2>
-    <p>Introduction paragraph...</p>
-    <h3>Subsection</h3>
-    <ul>
-        <li>Key point 1</li>
-        <li>Key point 2</li>
-    </ul>
-    ...
+    <p>Introduction paragraph with insights...</p>
+    <h3>Key Metrics</h3>
+    <table>...</table>
+    <h3>Visualization</h3>
+    <graph>Python matplotlib code for chart</graph>
+    <h3>Analysis</h3>
+    <p>Analysis of findings...</p>
 </section>
 
 Generate the content now:"""

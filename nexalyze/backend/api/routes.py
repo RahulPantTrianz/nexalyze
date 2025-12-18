@@ -157,6 +157,12 @@ async def background_report_task(task_id: str, topic: str, report_type: str, for
             "completed_at": datetime.now().isoformat()
         }, expire=86400) # 24 hours
         
+        # Increment reports counter in Redis
+        try:
+            redis_conn.incr("stats:total_reports")
+        except Exception as counter_error:
+            logger.warning(f"Could not increment reports counter: {counter_error}")
+        
     except Exception as e:
         logger.error(f"Background task failed: {e}")
         redis_conn.set(f"task:report:{task_id}", {
@@ -291,12 +297,35 @@ async def get_stats():
             except Exception:
                 pass
         
+        # Get AI queries count from Redis
+        total_queries = 0
+        try:
+            queries_count = redis_conn.get("stats:total_queries")
+            if queries_count is not None:
+                total_queries = int(queries_count) if isinstance(queries_count, (int, str)) else 0
+        except Exception as e:
+            logger.warning(f"Could not get queries count from Redis: {e}")
+        
+        # Get reports count from Redis (with fallback to file count)
+        total_reports = 0
+        try:
+            reports_count = redis_conn.get("stats:total_reports")
+            if reports_count is not None:
+                total_reports = int(reports_count) if isinstance(reports_count, (int, str)) else 0
+            else:
+                # Fallback: count report files in reports directory
+                reports_dir = os.path.join(os.path.dirname(__file__), '..', 'reports')
+                if os.path.exists(reports_dir):
+                    total_reports = len([f for f in os.listdir(reports_dir) if f.endswith('.pdf')])
+        except Exception as e:
+            logger.warning(f"Could not get reports count: {e}")
+        
         return {
             "success": True,
             "data": {
                 "total_companies": company_count,
-                "total_queries": 0,  # This will be tracked by frontend session
-                "total_reports": 0,  # This will be tracked by frontend session
+                "total_queries": total_queries,
+                "total_reports": total_reports,
                 "data_sources": 6
             }
         }
@@ -728,6 +757,12 @@ async def chat_interface(request: ResearchRequest):
                                     chunk = ' '.join(words[i:i + chunk_size])
                                     yield f"data: {json.dumps({'type': 'content', 'message': chunk, 'partial': True})}\n\n"
                                     await asyncio.sleep(0.02)  # Small delay for smooth streaming
+            
+            # Increment AI queries counter in Redis
+            try:
+                redis_conn.incr("stats:total_queries")
+            except Exception as counter_error:
+                logger.warning(f"Could not increment queries counter: {counter_error}")
             
             # Send completion message with full response
             yield f"data: {json.dumps({'type': 'complete', 'message': final_response, 'session_id': session_id, 'tools_used': tools_executed})}\n\n"

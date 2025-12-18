@@ -49,6 +49,7 @@ import re
 
 from services.data_service import DataService
 from services.research_service import ResearchService
+from services.graph_utils import process_graph_tags_sync
 
 logger = logging.getLogger(__name__)
 
@@ -60,13 +61,16 @@ class ReportService:
     def __init__(self):
         self.data_service = DataService()
         self.research_service = ResearchService()
-        self.reports_dir = "reports"
-        self.charts_dir = "charts"
+        # Use absolute paths based on module location
+        base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.reports_dir = os.path.join(base_dir, "reports")
+        self.charts_dir = os.path.join(base_dir, "charts")
         
         # Create directories if they don't exist
         for directory in [self.reports_dir, self.charts_dir]:
             if not os.path.exists(directory):
                 os.makedirs(directory)
+                logger.info(f"Created directory: {directory}")
         
         # Configure plotting
         plt.rcParams['figure.figsize'] = (10, 6)
@@ -1941,6 +1945,22 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             margin: 0 auto;
         }}
         
+        .chart-image {{
+            max-width: 100%;
+            height: auto;
+            border-radius: 8px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+            display: block;
+            margin: 25px auto;
+            background-color: white;
+            padding: 10px;
+        }}
+        
+        .chart-section {{
+            margin: 30px 0;
+            text-align: center;
+        }}
+        
         .footer {{
             margin-top: 40px;
             padding-top: 20px;
@@ -1998,11 +2018,21 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
     </div>
 """
         
-        # Add report sections
+        # Add report sections - process graph tags for dynamic visualizations
         for idx, section in enumerate(report_sections, 1):
+            section_content = section.get('content', '')
+            
+            # Process any <graph> tags in the section content
+            try:
+                if '<graph>' in section_content:
+                    section_content = process_graph_tags_sync(section_content)
+                    logger.info(f"Processed graph tags in section {idx}")
+            except Exception as e:
+                logger.warning(f"Error processing graph tags in section {idx}: {e}")
+            
             html += f"""
     <div class="section">
-        {section.get('content', '')}
+        {section_content}
     </div>
 """
             
@@ -2013,12 +2043,14 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
         
         # Add charts if available
         if chart_paths:
+            logger.info(f"Embedding {len(chart_paths)} charts into report HTML")
             html += """
     <div class="section">
         <h2>📊 Visualizations & Charts</h2>
 """
+            embedded_count = 0
             for chart_path in chart_paths:
-                if os.path.exists(chart_path):
+                if chart_path and os.path.exists(chart_path):
                     # Encode chart as base64 PNG for direct HTML embedding
                     chart_filename = os.path.basename(chart_path)
                     chart_data_url = self._encode_image_to_base64(chart_path)
@@ -2028,8 +2060,15 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             <img src="{chart_data_url}" alt="Chart: {chart_filename}" />
         </div>
 """
+                        embedded_count += 1
+                        logger.debug(f"Embedded chart: {chart_filename}")
+                    else:
+                        logger.warning(f"Failed to encode chart to base64: {chart_path}")
+                else:
+                    logger.warning(f"Chart file not found: {chart_path}")
             html += """    </div>
 """
+            logger.info(f"Successfully embedded {embedded_count}/{len(chart_paths)} charts")
         
         # Add footer
         html += f"""
