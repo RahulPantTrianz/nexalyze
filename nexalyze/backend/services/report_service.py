@@ -1783,6 +1783,19 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
     ) -> str:
         """Build complete HTML report from LangGraph sections"""
         companies = analysis_data.get('companies', [])
+        
+        # Calculate company count with fallback
+        company_count = len(companies)
+        if company_count == 0:
+            # Fallback to competitors + 1 (for main company)
+            competitors = analysis_data.get('competitors', [])
+            if competitors:
+                company_count = len(competitors) + 1
+            elif report_type == 'market_research':
+                # For market research without specific company list, use placeholder
+                company_count = "Market Overview"
+        
+        company_count_str = str(company_count)
         executive_summary = analysis_data.get('executive_summary', {})
         
         # Get report title from content table
@@ -1814,23 +1827,44 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
         }}
         
         .header {{
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #1a2980 0%, #26d0ce 100%);
             color: white;
-            padding: 40px 30px;
+            padding: 60px 40px;
             text-align: center;
-            border-radius: 10px;
-            margin-bottom: 30px;
+            border-radius: 12px;
+            margin-bottom: 40px;
+            box-shadow: 0 10px 20px rgba(0,0,0,0.1);
+            position: relative;
+            overflow: hidden;
+        }}
+        
+        .header::after {{
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: radial-gradient(circle at top right, rgba(255,255,255,0.1) 0%, transparent 60%);
         }}
         
         .header h1 {{
-            font-size: 32px;
-            margin-bottom: 10px;
-            font-weight: 700;
+            font-size: 42px;
+            margin-bottom: 15px;
+            font-weight: 800;
+            letter-spacing: -0.5px;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.2);
+            position: relative;
+            z-index: 1;
         }}
         
         .header p {{
-            font-size: 16px;
+            font-size: 18px;
             opacity: 0.95;
+            font-weight: 300;
+            position: relative;
+            z-index: 1;
+            letter-spacing: 0.5px;
         }}
         
         .meta-info {{
@@ -1997,7 +2031,7 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
             </tr>
             <tr>
                 <td>Companies Analyzed:</td>
-                <td><strong>{len(companies)}</strong></td>
+                <td><strong>{company_count_str}</strong></td>
             </tr>
             <tr>
                 <td>Sections:</td>
@@ -2041,34 +2075,7 @@ Return ONLY the HTML content (no explanations). Start with <html> and end with <
                 html += """    <div class="page-break"></div>
 """
         
-        # Add charts if available
-        if chart_paths:
-            logger.info(f"Embedding {len(chart_paths)} charts into report HTML")
-            html += """
-    <div class="section">
-        <h2>📊 Visualizations & Charts</h2>
-"""
-            embedded_count = 0
-            for chart_path in chart_paths:
-                if chart_path and os.path.exists(chart_path):
-                    # Encode chart as base64 PNG for direct HTML embedding
-                    chart_filename = os.path.basename(chart_path)
-                    chart_data_url = self._encode_image_to_base64(chart_path)
-                    if chart_data_url:
-                        html += f"""
-        <div class="chart-container">
-            <img src="{chart_data_url}" alt="Chart: {chart_filename}" />
-        </div>
-"""
-                        embedded_count += 1
-                        logger.debug(f"Embedded chart: {chart_filename}")
-                    else:
-                        logger.warning(f"Failed to encode chart to base64: {chart_path}")
-                else:
-                    logger.warning(f"Chart file not found: {chart_path}")
-            html += """    </div>
-"""
-            logger.info(f"Successfully embedded {embedded_count}/{len(chart_paths)} charts")
+
         
         # Add footer
         html += f"""
